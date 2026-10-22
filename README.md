@@ -218,14 +218,104 @@ GET    /v1/clm/sessions/<id>/archive?q=…   search the eviction archive
 POST   /v1/clm/sessions/<id>/reinject {block_id}
 POST   /v1/clm/sessions/<id>/settings {shortterm_keep_pct, max_context_tokens,
                                           systemone_evict_threshold}
+GET    /v1/clm/sessions/<id>/tools          agent tool state (+ toggle)
+POST   /v1/clm/sessions/<id>/tools {target,on} or {approval_mode}
+GET    /v1/clm/sessions/<id>/activity?limit=&full=   tool activity log
+GET    /v1/clm/sessions/<id>/approvals      pending + resolved approvals
+POST   /v1/clm/sessions/<id>/approvals {id,approve}  decide one
+POST   /v1/clm/sessions/<id>/search {query}         direct web search
+POST   /v1/clm/sessions/<id>/toolcall {tool,args}   run any tool directly
+GET    /v1/clm/sessions/<id>/sandbox[?path=]        sandbox info + file list
+GET    /v1/clm/sessions/<id>/sandbox/file?path=     read one sandbox file
+POST   /v1/clm/sessions/<id>/sandbox/exec {command} human terminal command
+POST   /v1/clm/sessions/<id>/sandbox/write {path,content}
+DELETE /v1/clm/sessions/<id>/sandbox              reset (wipe) the sandbox
 ```
 
 **MCP toolbox.** `serve` is also an MCP server (streamable HTTP JSON-RPC at
 `/mcp`): `initialize`, `tools/list`, `tools/call` with tools `clm_chat`,
 `clm_status`, `clm_blocks`, `clm_recall`, `clm_reinject`,
-`clm_set_keep_pct`, `clm_workspaces`. Point any MCP client at the URL and it
-gets the identical per-workspace memory — same library, same harnesses, no
-extra process.
+`clm_set_keep_pct`, `clm_workspaces`, plus the agent surface — `clm_tools`,
+`clm_tool_on`, `clm_tool_call`, `clm_sandbox_exec`, `clm_web_search`. Point
+any MCP client at the URL and it gets the identical per-workspace memory and
+the identical tools the web studio toggles control — same library, same
+harnesses, no extra process.
+
+## Agent mode: sessions that also act
+
+Memory alone decides what a session keeps; `--tools` lets the same session
+also *do* things — web search, sandboxed commands and file work. The point
+of building it next to the memory harness is that **tool output is just more
+context**: executed calls enter the live window as short-term blocks and obey
+the same budget and eviction rules as chat, so an agent's long scratchpad is
+forgettable working state instead of a context bomb.
+
+Seven tools in three categories:
+
+| Category | Tools | Notes |
+|---|---|---|
+| **web** | `web_search`, `web_fetch` | read-only; providers: `ddg` (no key), `brave`/`tavily`/`exa` (`$…_API_KEY`), `stub` (offline deterministic), `off` |
+| **exec** | `run_command`, `run_python` | mutating; run inside the session sandbox |
+| **fs** | `write_file`, `read_file`, `list_files` | read tools are read-only; paths are jail-contained |
+
+**Sandbox levels** (`--sandbox-mode`): every workspace gets its own sandbox
+under `<workdir>/workspaces/<name>/sandbox`. `jail` (default) is a *limited
+process*: subprocess pinned to the sandbox dir with a scrubbed environment
+(host secrets like API keys never leak in), wall-clock timeout, CPU/address-
+space/file-size/process rlimits and output caps — strong enough for research
+and demos, honest about not being a security boundary against a hostile
+script. `docker` runs each command in a real container (`--network none`, memory/cpu/volume limits) when the docker CLI is available, falling back to
+the jail with an explanatory note; the UI/CLI always show which level
+actually ran. `off` removes exec/fs tools entirely.
+
+**Approval policies** (`--ask` / `--approval-mode`): `auto` (default) runs
+mutating tools inside the sandbox without asking; `ask` pauses them until a
+human decides — inline prompt in a local CLI, live approval card in the web
+studio, or REST/MCP from anywhere; `deny` never runs them. Read-only tools
+never need approval, and human-initiated calls (composer buttons, slash
+commands) are approved by definition.
+
+```bash
+clm-mem serve --use-mock --tools --search-provider stub   # offline demo
+clm-mem serve --backend-url http://localhost:8000/v1 --tools \
+    --sandbox-mode docker --ask                            # real model, containers
+```
+
+**Web studio UX (Unsloth-Studio-shaped).** The composer shows a tool bar —
+toggles for 🌐 web / 💻 run / 📁 files plus an approval-policy select; when
+the model uses tools mid-turn, **live activity cards** appear in the
+transcript (spinner while running, ✓/✗/denied states, click to expand full
+output), and under `ask` an **approval card** with approve/deny buttons
+appears right where the request happened. A new **Sandbox tab** gives each
+project a mini terminal (`$ …` log), file list with viewer, isolation level,
+disk usage vs quota, and a reset button. Tool calls never print raw context
+at you: summaries stay collapsed, details expand on demand.
+
+**CLI UX (the same language at the prompt).** `clm-mem chat` gains an agent
+cast of slash commands, identical in meaning to the studio's toggles/cards:
+
+```
+/tools                       state per category + policy + sandbox isolation
+/tools on|off web|exec|fs|all|<tool>      toggles (same as the composer bar)
+/tools auto|ask|deny         approval policy
+/web <query>                 direct web search (results laid out, not dumped)
+/fetch <url>                 fetch a page
+/run <command>  /py <code>   sandbox exec / python snippet
+/files [path]  /cat <path>  /rm <path>     file work
+/sandbox [info|reset]        isolation level, usage vs quota, wipe
+/activity [n]  /tool <seq>   activity log; expand one entry's output
+/approvals   /approve <id>   /deny <id>    resolve pending requests
+```
+
+After a model turn that used tools the CLI prints a `⚡ tools used this
+turn:` summary (one line per call, deduped across sessions). Under `ask`, a
+local session prompts inline (`allow? [y/n/a]` — `a` switches the rest of the
+session to auto); an *attached* session under `ask` resolves through the
+studio cards or a second terminal running `/approvals` + `/approve <id>`.
+The bundled mock backend answers `tools=[...]` requests with deterministic
+tool-calls planned from wording ("search …", "run command …", "python …"),
+so the whole agent loop — search → fetch → exec → files — is exercisable
+offline end to end, in serve, web studio, CLI and MCP alike.
 
 ## Attach a CLI chat to a running server
 

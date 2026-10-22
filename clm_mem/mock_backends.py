@@ -94,15 +94,47 @@ class LLMHandler(_Silent):
 
     def _reply_for(self, body: dict) -> str:
         chat = self.setup_chat()
+        msg = self._message_for(body, chat)
+        return msg.get("content") or ""
+
+    def _message_for(self, body: dict, chat=None) -> dict:
+        """Reply as a message dict, honouring ``tools`` with real tool_calls.
+
+        The bundled stub plans one deterministic call per turn (see
+        :class:`clm_mem.llm.StubChat.chat_tools`), so the whole agent loop --
+        web search, sandbox exec, file work -- is exercisable without a GPU.
+        """
+        if chat is None:
+            chat = self.setup_chat()
         msgs = body.get("messages")
+        tools = body.get("tools")
         if isinstance(msgs, list) and msgs:
-            return chat.chat(msgs)
+            if tools and hasattr(chat, "chat_tools"):
+                return chat.chat_tools(msgs, tools)
+            return {"role": "assistant",
+                    "content": self._plain_reply(chat, msgs)}
         prompt = body.get("prompt", "")
         if isinstance(prompt, list):
             prompt = " ".join(str(p) for p in prompt)
-        return chat.chat([{"role": "user", "content": str(prompt)}])
+        return {"role": "assistant",
+                "content": chat.chat([{"role": "user",
+                                       "content": str(prompt)}])}
 
-    def _sse_stream(self, reply: str, model: str):
+    @staticmethod
+    def _plain_reply(chat, msgs) -> str:
+        return chat.chat(msgs)
+
+    @staticmethod
+    def _tool_delta(message: dict):
+        calls = message.get("tool_calls")
+        if not calls:
+            return None
+        return [{"id": c.get("id"), "type": "function",
+                 "function": {"name": (c.get("function") or {}).get("name"),
+                              "arguments": (c.get("function") or {}).get(
+                                  "arguments")}} for c in calls]
+
+    def _sse_stream(self, reply: str, model: str, message: dict | None = None):
         self.send_response(200)
         self._cors()
         self.send_header("Content-Type", "text/event-stream")
@@ -121,6 +153,9 @@ class LLMHandler(_Silent):
         chunk({"role": "assistant"})
         for piece in _word_chunks(reply):
             chunk({"content": piece})
+        calls = self._tool_delta(message or {})
+        if calls:
+            chunk({"tool_calls": calls})
         chunk({}, finish="stop")
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -147,16 +182,18 @@ class LLMHandler(_Silent):
         path = self.path.split("?")[0]
         body = self.read_body()
         if path == "/v1/chat/completions":
-            reply = self._reply_for(body)
+            message = self._message_for(body)
+            reply = message.get("content") or ""
             model = body.get("model") or self.MODEL
             if body.get("stream"):
-                self._sse_stream(reply, model)
+                self._sse_stream(reply, model, message)
                 return
+            msg: dict = {"role": "assistant", "content": reply}
+            if message.get("tool_calls"):
+                msg["tool_calls"] = message["tool_calls"]
             resp = {"id": "mock-proxy-1", "object": "chat.completion",
                     "created": int(time.time()), "model": model,
-                    "choices": [{"index": 0,
-                                 "message": {"role": "assistant",
-                                             "content": reply},
+                    "choices": [{"index": 0, "message": msg,
                                  "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1,
                               "total_tokens": 2}}

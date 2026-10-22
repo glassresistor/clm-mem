@@ -48,6 +48,21 @@
         <textarea id="input" rows="1" placeholder="Message — Enter to send, Shift+Enter for newline"></textarea>
         <button id="sendBtn" type="submit">Send</button>
       </div>
+      <div class="comp-tools" id="toolBar">
+        <span class="tb-label">tools</span>
+        <label class="tb-toggle" data-cat="web"><input type="checkbox"
+          id="toolWeb"> 🌐 web</label>
+        <label class="tb-toggle" data-cat="exec"><input type="checkbox"
+          id="toolExec"> 💻 run</label>
+        <label class="tb-toggle" data-cat="fs"><input type="checkbox"
+          id="toolFs"> 📁 files</label>
+        <select id="policySel" title="approval policy for mutating tools">
+          <option value="auto">auto-run</option>
+          <option value="ask">ask first</option>
+          <option value="deny">never run</option>
+        </select>
+        <span id="toolStatus" class="tb-status"></span>
+      </div>
       <div class="comp-meta">
         <span id="statusLine">ready</span>
         <label class="hint-toggle"><input type="checkbox" id="hintsOn" checked> context hints</label>
@@ -60,6 +75,7 @@
       <button data-tab="context" class="on">Context</button>
       <button data-tab="archive">Archive</button>
       <button data-tab="events">Events</button>
+      <button data-tab="sandbox">Sandbox</button>
       <button data-tab="tuning">Tuning</button>
     </nav>
 
@@ -106,11 +122,30 @@
         <input type="checkbox" id="supOn"></label>
       <p class="note">Changes apply live to the selected project's session.</p>
     </div>
+
+    <div id="tab-sandbox" class="tab" hidden>
+      <div class="sb-info">
+        <span id="sbIso">—</span>
+        <span id="sbUsage">0 files</span>
+      </div>
+      <form id="termForm">
+        <input id="termInput" placeholder="$ run a command in this sandbox"
+          autocomplete="off">
+        <button type="submit">run</button>
+      </form>
+      <pre id="termLog" class="term-log"></pre>
+      <div class="sb-head-row">
+        <span class="tune-group">files</span>
+        <button id="sbRefreshBtn" class="ghost tiny" title="refresh">⟳</button>
+        <button id="sbResetBtn" class="ghost tiny danger">reset sandbox</button>
+      </div>
+      <ul id="fileList"><li class="empty">Empty sandbox.</li></ul>
+      <pre id="fileView" class="file-view" hidden></pre>
+    </div>
   </aside>
 </main>
 
 <div id="toast"></div>
-<script src="/dyson.js"></script>
 <script src="/dyson.js"></script>
 <script src="/app.js"></script>
 </body>

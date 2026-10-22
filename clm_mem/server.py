@@ -33,6 +33,7 @@ from urllib.parse import parse_qs, unquote
 from .config import HarnessConfig
 from .harness import MemoryHarness
 from .llm import OpenAIChat
+from .tools import ToolCall
 from .processes import ProcessManager, free_port, render_flags
 
 VERSION = "0.3.0"
@@ -391,7 +392,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         sup = self.supervisor
         path = unquote(self.path.split("?")[0])
         if path.startswith("/v1/clm/sessions/"):
-            sid = path[len("/v1/clm/sessions/"):].rstrip("/")
+            parts = [p for p in unquote(path).split("/") if p]
+            sid = parts[3] if len(parts) > 3 else ""
+            if len(parts) == 6 and parts[5] == "sandbox":
+                h = sup.get_session(sid)
+                if h is None:
+                    return self.send_error_json(404, f"unknown session {sid!r}")
+                return self.send_json({"deleted": f"{sid}/sandbox",
+                                       **h.tools.sandbox.reset()})
             existed = sup.drop_session(sid)
             if not existed:
                 self.send_error_json(404, f"unknown session {sid!r}")
@@ -495,6 +503,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # the llama.cpp window the budget is bounded by (if known)
             snap["backend_ctx"] = sup.config.backend_ctx
             return self.send_json(snap)
+        if action in ("tools", "activity", "approvals", "sandbox"):
+            # the agent surface reads lazily: toggling tools before the first
+            # message should work, so create the session on demand here.
+            h = sup.harness_for(sid)
+            return self._clm_tools_get(h, sid, action, qd)
         if action == "archive":
             if h is None:
                 return self.send_error_json(404, f"unknown session {sid!r}")
@@ -537,6 +550,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if action == "reset":
             existed = sup.drop_session(sid)
             return self.send_json({"reset": sid, "existed": existed})
+        # the agent surface creates its session on demand: toggling tools or
+        # poking the sandbox before a first message is legitimate UX.
+        if action in ("tools", "activity", "approvals", "sandbox", "search",
+                     "toolcall"):
+            h = sup.harness_for(sid)
+            return self._clm_tools_post(h, sid, action, body)
         h = sup.get_session(sid)
         if h is None:
             return self.send_error_json(404, f"unknown session {sid!r}")
@@ -608,6 +627,136 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return self.send_json({"session_id": sid,
                                    "changed": changed, "status": h.status()})
         return self.send_error_json(404, f"no route for {path}")
+
+    # -- agent tools / sandbox API ---------------------------------------------
+    def _clm_tools_get(self, h, sid: str, action: str, qd: Dict):
+        """GET surface for the studio's activity cards and sandbox panel."""
+        if action == "tools":
+            return self.send_json({"session_id": sid,
+                                    "tools": h.tools.describe(),
+                                    **h.tools.state()})
+        if action == "activity":
+            try:
+                limit = int(qd.get("limit", ["24"])[0])
+            except ValueError:
+                limit = 24
+            full = qd.get("full", ["0"])[0].lower() in ("1", "true", "yes")
+            return self.send_json({"session_id": sid,
+                                    "activity": h.tools.activity(limit=limit,
+                                                                 full=full)})
+        if action == "approvals":
+            return self.send_json({"session_id": sid, **h.tools.approvals()})
+        if action == "sandbox":
+            parts = [p for p in unquote(self.path.split("?")[0]).split("/")
+                     if p]
+            if len(parts) == 6 and parts[5] == "file":
+                path = qd.get("path", [""])[0]
+                try:
+                    limit = int(qd.get("max", ["20000"])[0])
+                except ValueError:
+                    limit = 20_000
+                try:
+                    out = h.tools.sandbox.read_file(path, limit=limit)
+                except (FileNotFoundError, NotADirectoryError,
+                        ValueError) as exc:
+                    return self.send_error_json(404, str(exc))
+                return self.send_json({"session_id": sid, **out})
+            sub = qd.get("path", ["."])[0]
+            try:
+                files = h.tools.sandbox.list_files(sub)
+            except (OSError, ValueError) as exc:
+                return self.send_error_json(400, str(exc))
+            return self.send_json({"session_id": sid,
+                                   "sandbox": h.tools.sandbox.info(),
+                                   "path": sub, "files": files})
+        return self.send_error_json(404, f"no route for {self.path}")
+
+    def _clm_tools_post(self, h, sid: str, action: str, body: Dict):
+        """POST surface: tool toggles, approval decisions, sandbox actions."""
+        parts = [p for p in unquote(self.path.split("?")[0]).split("/") if p]
+        sub = parts[5] if len(parts) > 5 else ""
+        try:
+            if action == "tools":
+                if "approval_mode" in body:
+                    out = h.tools.set_policy(str(body["approval_mode"]))
+                    return self.send_json({"session_id": sid,
+                                           **out, "changed": "approval_mode"})
+                if "enabled" in body and "target" not in body:
+                    out = h.tools.set_master(bool(body["enabled"]))
+                    return self.send_json({"session_id": sid, **out,
+                                           "changed": "master"})
+                target = str(body.get("target", "all"))
+                on = body.get("on")
+                out = h.tools.toggle(target, None if on is None else bool(on))
+                return self.send_json({"session_id": sid, **out,
+                                       "changed": target})
+            if action == "approvals":
+                aid = str(body.get("id", ""))
+                approve = bool(body.get("approve", body.get("approved", False)))
+                out = h.tools.broker.decide(aid, approve,
+                                            str(body.get("by", "web")))
+                if "error" in out:
+                    return self.send_error_json(404, out["error"])
+                return self.send_json({"session_id": sid, **out})
+            if action == "toolcall":
+                name = str(body.get("tool", "")).strip()
+                call = ToolCall(id="rest-call", name=name,
+                                args=dict(body.get("args") or {}),
+                                origin=str(body.get("origin", "user")))
+                res = h.tools.execute(call)
+                return self.send_json({"session_id": sid, "ok": res.ok,
+                                       "summary": res.summary,
+                                       "detail": res.detail,
+                                       "error": res.error, **res.data})
+            if action == "sandbox":
+                if sub == "delete":
+                    try:
+                        out = h.tools.sandbox.delete(str(body.get("path", "")))
+                    except (FileNotFoundError, ValueError) as exc:
+                        return self.send_error_json(400, str(exc))
+                    return self.send_json({"session_id": sid, **out})
+                if sub == "exec":
+                    command = str(body.get("command", "")).strip()
+                    if not command:
+                        return self.send_error_json(400,
+                                                    "command is required")
+                    call = ToolCall(id="user-exec", name="run_command",
+                                    args={"command": command,
+                                          "cwd": str(body.get("cwd", "")),
+                                          "timeout": body.get("timeout")},
+                                    origin="user")
+                    res = h.tools.execute(call)
+                    return self.send_json({"session_id": sid, "ok": res.ok,
+                                           "summary": res.summary,
+                                           "detail": res.detail,
+                                           **res.data})
+                if sub == "write":
+                    path = str(body.get("path", ""))
+                    content = str(body.get("content", ""))
+                    info = h.tools.sandbox.write_file(
+                        path, content, append=bool(body.get("append")))
+                    return self.send_json({"session_id": sid, **info})
+                if sub == "reset":
+                    return self.send_json({"session_id": sid,
+                                           **h.tools.sandbox.reset()})
+                return self.send_error_json(404, f"no route for {self.path}")
+            if action == "search":
+                query = str(body.get("query", "")).strip()
+                if not query:
+                    return self.send_error_json(400, "query is required")
+                call = ToolCall(id="user-search", name="web_search",
+                                args={"query": query,
+                                      "max_results": int(body.get("max_results",
+                                                                 5))},
+                                origin="user")
+                res = h.tools.execute(call)
+                return self.send_json({"session_id": sid, "ok": res.ok,
+                                       "summary": res.summary,
+                                       "hits": res.data.get("hits", []),
+                                       "error": res.error})
+        except ValueError as exc:
+            return self.send_error_json(400, str(exc))
+        return self.send_error_json(404, f"no route for {self.path}")
 
     # -- chat completions: passthrough or memory-managed ---------------------
     def _chat_completions(self):

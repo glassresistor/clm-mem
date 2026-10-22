@@ -37,6 +37,37 @@ class OpenAIChat:
         )
         return resp.choices[0].message.content or ""
 
+    def chat_tools(self, messages: List[Dict], tools: Optional[List[Dict]] = None,
+                   temperature: Optional[float] = None,
+                   max_tokens: Optional[int] = None) -> Dict:
+        """One tool-capable completion; returns the raw assistant message.
+
+        Servers that reject ``tools`` raise, and the caller falls back to a
+        plain chat -- old llama.cpp builds stay supported.
+        """
+        kwargs: Dict[str, object] = dict(
+            model=self.model, messages=messages,
+            temperature=self.temperature if temperature is None else temperature,
+            max_tokens=self.max_tokens if max_tokens is None else max_tokens)
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        resp = self.client.chat.completions.create(**kwargs)
+        msg = resp.choices[0].message
+        try:
+            out = msg.model_dump()
+        except AttributeError:      # pragma: no cover - older openai SDK
+            out = {"role": "assistant",
+                   "content": getattr(msg, "content", None) or ""}
+            if getattr(msg, "tool_calls", None):
+                out["tool_calls"] = [
+                    {"id": c.id, "type": "function",
+                     "function": {"name": c.function.name,
+                                  "arguments": c.function.arguments}}
+                    for c in msg.tool_calls]
+        out.setdefault("role", "assistant")
+        return out
+
 
 class StubChat:
     """Deterministic fake LLM: emits inline memory tags and answers the
@@ -62,6 +93,95 @@ class StubChat:
             return self._classify(last)
         i = last.count("\n") + len(last) % 97
         return self._FACTS[i % len(self._FACTS)].format(i=i)
+
+    # -- deterministic tool-calling (offline agent demos / tests) ------------
+    #: marker the harness uses for executed-tool transcript blocks
+    TOOL_MARK = "tool "
+
+    _QUOTED = re.compile(r"[\"'`]([^\"'`]{1,200})[\"'`]")
+
+    def chat_tools(self, messages: List[Dict], tools: Optional[List[Dict]] = None,
+                   temperature: Optional[float] = None,
+                   max_tokens: Optional[int] = None) -> Dict:
+        """Plan one tool call from the user's wording, or converge to an answer.
+
+        Deterministic keyword planner -- no network, no GPU. If a tool
+        transcript is already in context it answers with a summary instead of
+        calling again, so offline agent loops always terminate.
+        """
+        specs = {} if not tools else {}
+        for t in tools or []:
+            fn = t.get("function") or {}
+            name = fn.get("name") or t.get("name")
+            if name:
+                specs[name] = t
+        if not specs:
+            return {"role": "assistant", "content": self.chat(messages)}
+        # only transcripts emitted *after* the current user message count, so
+        # one turn's tool work never blocks the next turn from planning
+        idx = -1
+        for i, m in enumerate(messages):
+            if m.get("role") == "user":
+                idx = i
+        transcript = [m for m in messages[idx + 1:]
+                      if str(m.get("content", "") or "").startswith(
+                          "[" + self.TOOL_MARK)]
+        if transcript:
+            return {"role": "assistant", "content": self._tool_answer(transcript)}
+        last_user = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user = str(m.get("content", ""))
+                break
+        plan = self._plan_tool(last_user, specs)
+        if plan is None:
+            return {"role": "assistant", "content": self.chat(messages)}
+        name, args = plan
+        return {"role": "assistant", "content": None,
+                "tool_calls": [{"id": "stub-call-1", "type": "function",
+                                "function": {"name": name,
+                                            "arguments": json.dumps(args)}}]}
+
+    def _plan_tool(self, text: str, specs: Dict[str, Dict]):
+        low = text.lower()
+        quoted = self._QUOTED.findall(text)
+        if any(k in low for k in ("search", "look up", "find out", "google",
+                                  "latest", "who is")) and "web_search" in specs:
+            q = quoted[0] if quoted else text.strip()
+            return "web_search", {"query": q, "max_results": 3}
+        if any(k in low for k in ("run command", "shell", "terminal", "execute",
+                                  "run ")) and "run_command" in specs:
+            cmd = quoted[0] if quoted else "echo hello from the sandbox"
+            return "run_command", {"command": cmd}
+        if any(k in low for k in ("python", "code", "compute", "calculate",
+                                  "write a function")) and "run_python" in specs:
+            code = quoted[0] if quoted else \
+                "print(sum(i*i for i in range(10)))"
+            return "run_python", {"code": code}
+        if any(k in low for k in ("write file", "save to file", "create a file",
+                                  "asset")) and "write_file" in specs:
+            path = "notes.md"
+            body = quoted[0] if quoted else "created by clm-mem agent"
+            return "write_file", {"path": path, "content": body + "\n"}
+        if any(k in low for k in ("list files", "what files", "read file")):
+            if "list_files" in specs:
+                return "list_files", {"path": "."}
+            if "read_file" in specs and quoted:
+                return "read_file", {"path": quoted[0]}
+        return None
+
+    def _tool_answer(self, transcript: List[Dict]) -> str:
+        lines = []
+        for m in transcript:
+            content = str(m.get("content", ""))
+            head = content.split("\n", 1)[0]
+            body = content.split("\n", 1)[1] if "\n" in content else ""
+            # show the call itself, not the harness markup
+            lines.append(head.replace("[tool ", "").replace("]", "")[:160])
+            if body:
+                lines.append(body[:200].replace("\n", " "))
+        return ("Done — I used the tools you asked for:\n" +
+                "\n".join(lines))
 
     @classmethod
     def _classify(cls, prompt: str) -> str:

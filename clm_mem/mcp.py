@@ -12,6 +12,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .server import VERSION as SERVER_VERSION
+from .tools import ToolCall
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "clm-mem",
@@ -82,11 +83,95 @@ TOOLS: List[Dict] = [
      "description": ("List project workspaces (sandboxes) with their active "
                      "session stats."),
      "inputSchema": _obj({}, [])},
+
+    # -- agent tools: identical to the web studio toggles and CLI slash cmds --
+    {"name": "clm_tools",
+     "description": ("Inspect a workspace session's agent tools: which are "
+                     "enabled (web / exec / fs categories), the approval "
+                     "policy, sandbox isolation level and recent activity."),
+     "inputSchema": _obj({"workspace": _WS,
+                          "activity": {"type": "integer", "default": 10}},
+                         [])},
+    {"name": "clm_tool_on",
+     "description": ("Enable/disable agent tools live: target is a category "
+                     "(web, exec, fs) or a tool name (all toggles every one). "
+                     "Also accepts approval_mode=auto|ask|deny."),
+     "inputSchema": _obj({"target": _STR,
+                          "on": {"type": "boolean"},
+                          "approval_mode": {"type": "string",
+                                           "enum": ["auto", "ask", "deny"]},
+                          "workspace": _WS}, ["target"])},
+    {"name": "clm_tool_call",
+     "description": ("Run one clm-mem tool directly (web_search, web_fetch, "
+                     "run_command, run_python, write_file, read_file, "
+                     "list_files). Subject to the session's approval policy; "
+                     "read-only tools always run."),
+     "inputSchema": _obj({"tool": _STR,
+                          "args": {"type": "object", "description":
+                                   "tool arguments"},
+                          "workspace": _WS}, ["tool"])},
+    {"name": "clm_sandbox_exec",
+     "description": ("Run a shell command inside a workspace's sandbox "
+                     "(bounded process; cwd is the sandbox root). Human-"
+                     "initiated, so it bypasses approval prompts."),
+     "inputSchema": _obj({"command": _STR,
+                          "cwd": _STR,
+                          "timeout": {"type": "number"},
+                          "workspace": _WS}, ["command"])},
+    {"name": "clm_web_search",
+     "description": ("Search the web with the session's configured provider "
+                     "(stub/ddg/brave/tavily/exa) without a model turn."),
+     "inputSchema": _obj({"query": _STR,
+                          "max_results": {"type": "integer", "default": 5},
+                          "workspace": _WS}, ["query"])}
+,
 ]
 
 
 def _text(msg: str, is_error: bool = False) -> Dict:
     return {"content": [{"type": "text", "text": msg}], "isError": is_error}
+
+
+def _agent_result(sup, sid: str, name: str, args: Dict[str, Any]) -> Dict:
+    """MCP handlers for the agent surface (same library as the web studio)."""
+    h = sup.harness_for(sid)
+    if name == "clm_tools":
+        tail = int(args.get("activity", 10) or 10)
+        return _text(json.dumps({**h.tools.state(),
+                                 "tools": h.tools.describe(),
+                                 "activity": h.tools.activity(limit=tail)}))
+    if name == "clm_tool_on":
+        if args.get("approval_mode"):
+            h.tools.set_policy(str(args["approval_mode"]))
+        on = args.get("on")
+        out = h.tools.toggle(str(args.get("target", "all")),
+                             None if on is None else bool(on))
+        return _text(json.dumps(out))
+    if name == "clm_tool_call":
+        call = ToolCall(id="mcp-call",
+                        name=str(args.get("tool", "")).strip(),
+                        args=dict(args.get("args") or {}), origin="mcp")
+        res = h.tools.execute(call)
+        return _text(f"{res.summary}\n{res.detail[:4000]}".strip(),
+                     is_error=not res.ok)
+    if name == "clm_sandbox_exec":
+        call = ToolCall(id="mcp-exec", name="run_command",
+                        args={"command": str(args.get("command", "")).strip(),
+                              "cwd": str(args.get("cwd", "")),
+                              "timeout": args.get("timeout")},
+                        origin="user")        # human-initiated: never asks
+        res = h.tools.execute(call)
+        return _text(f"{res.summary}\n{res.detail[:4000]}".strip(),
+                     is_error=not res.ok)
+    if name == "clm_web_search":
+        call = ToolCall(id="mcp-web", name="web_search",
+                        args={"query": str(args.get("query", "")).strip(),
+                              "max_results": int(args.get("max_results", 5))},
+                        origin="user")
+        res = h.tools.execute(call)
+        return _text(f"{res.summary}\n{res.detail[:4000]}".strip(),
+                     is_error=not res.ok)
+    return _text(f"unknown agent tool {name!r}", is_error=True)
 
 
 def _tool_result(sup, name: str, args: Dict[str, Any]) -> Dict:
@@ -95,6 +180,10 @@ def _tool_result(sup, name: str, args: Dict[str, Any]) -> Dict:
             return _text(json.dumps({"workspaces": sup.list_workspaces()}))
 
         sid = _sid(args)
+        # -- agent tools -------------------------------------------------
+        if name in ("clm_tools", "clm_tool_on", "clm_tool_call",
+                    "clm_sandbox_exec", "clm_web_search"):
+            return _agent_result(sup, sid, name, args)
         if name == "clm_chat":
             h = sup.harness_for(sid)
             reply = h.step(str(args.get("message", "")))

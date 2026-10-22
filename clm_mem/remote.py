@@ -144,6 +144,77 @@ class RemoteHarness:
         except RuntimeError:
             return False
 
+    # -- agent tools (same surface the web studio drives) -------------------
+    def tools(self) -> Dict:
+        return self._req("GET", f"{self._snap_path}/tools")
+
+    def set_tools(self, target: str = "all", on: Optional[bool] = None,
+                  approval_mode: str = "") -> Dict:
+        body: Dict[str, object] = {}
+        if approval_mode:
+            body["approval_mode"] = approval_mode
+        else:
+            body["target"] = target
+            if on is not None:
+                body["on"] = bool(on)
+        return self._req("POST", f"{self._snap_path}/tools", body)
+
+    def activity(self, limit: int = 24, full: bool = False) -> List[Dict]:
+        d = self._req("GET", f"{self._snap_path}/activity"
+                      f"?limit={int(limit)}&full={'1' if full else '0'}")
+        return d.get("activity", [])
+
+    def approvals(self) -> Dict:
+        return self._req("GET", f"{self._snap_path}/approvals")
+
+    def approve(self, approval_id: str, ok: bool = True,
+                by: str = "cli") -> Dict:
+        return self._req("POST", f"{self._snap_path}/approvals",
+                         {"id": approval_id, "approve": bool(ok), "by": by})
+
+    def tool_call(self, name: str, args: Optional[Dict] = None) -> Dict:
+        """Run any session tool directly (web_fetch, run_python, ...)."""
+        return self._req("POST", f"{self._snap_path}/toolcall",
+                         {"tool": name, "args": dict(args or {})})
+
+    def web_search(self, query: str, limit: int = 5) -> Dict:
+        return self._req("POST", f"{self._snap_path}/search",
+                         {"query": query, "max_results": int(limit)})
+
+    # -- sandbox -----------------------------------------------------------
+    def sandbox_files(self, path: str = ".") -> Dict:
+        from urllib.parse import quote as q
+        return self._req("GET", f"{self._snap_path}/sandbox"
+                         f"?path={q(path)}")
+
+    def sandbox_read(self, path: str, limit: int = 20_000) -> Dict:
+        from urllib.parse import quote as q
+        return self._req("GET", f"{self._snap_path}/sandbox/file"
+                         f"?path={q(path)}&max={int(limit)}")
+
+    def sandbox_write(self, path: str, content: str,
+                      append: bool = False) -> Dict:
+        return self._req("POST", f"{self._snap_path}/sandbox/write",
+                         {"path": path, "content": content,
+                          "append": bool(append)})
+
+    def sandbox_exec(self, command: str, cwd: str = "",
+                     timeout: Optional[float] = None) -> Dict:
+        body: Dict[str, object] = {"command": command}
+        if cwd:
+            body["cwd"] = cwd
+        if timeout:
+            body["timeout"] = float(timeout)
+        return self._req("POST", f"{self._snap_path}/sandbox/exec", body)
+
+    def sandbox_delete(self, path: str) -> Dict:
+        return self._req("POST", f"{self._snap_path}/sandbox/delete",
+                         {"path": path})
+
+    def sandbox_reset(self) -> Dict:
+        from urllib.parse import quote as q
+        return self._req("DELETE", f"{self._snap_path}/sandbox")
+
     # -- lifecycle -----------------------------------------------------------
     def reset(self) -> None:
         self._req("POST", f"{self._snap_path}/reset")

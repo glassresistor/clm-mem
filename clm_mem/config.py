@@ -1,5 +1,7 @@
-"""Harness configuration. All knobs live here; ``shortterm_keep_pct`` is the
-variable that controls how much short-term memory survives each FIFO round."""
+"""Harness configuration. All knobs live here: ``shortterm_keep_pct`` controls
+how much short-term memory survives each FIFO round, and the agent block below
+decides whether a session may also *act* (web search, sandboxed commands,
+file work) instead of only remembering."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -44,7 +46,23 @@ class HarnessConfig:
     # importance immediately (forgotten fast); when False it keeps the value
     # it had and stays eligible for reheating until the decay curve demotes it
 
-    # --- files / serving ----------------------------------------------------
+    # --- agent tools (opt-in; defaults preserve prior behaviour) --------------
+    # The same session that remembers may also act: web search, sandboxed
+    # commands and file work, fed back into context as short-term blocks.
+    tools_enabled: bool = False       # master switch for the tool loop
+    sandbox_mode: str = "jail"        # off | jail (limited process) | docker
+    sandbox_image: str = "python:3.12-slim"   # docker mode only
+    sandbox_disk_mb: int = 256        # soft disk quota per session sandbox
+    sandbox_mem_mb: int = 512         # address-space / container memory cap
+    approval_mode: str = "auto"       # auto | ask | deny (mutating tools)
+    max_tool_calls: int = 8           # agent-loop iterations per turn
+    tool_timeout: float = 30.0        # wall-clock cap per exec / fetch call
+    approval_timeout: float = 300.0   # how long a pending approval waits
+    search_provider: str = "ddg"      # ddg | brave | tavily | exa | stub | off
+    max_search_results: int = 5
+    fetch_max_chars: int = 6000       # web_fetch body cap
+    exec_output_limit: int = 8000     # stdout/stderr cap per command
+
     workdir: str = "."                  # context.md / context.jsonl / archive.jsonl live here
     tokenizer_name: str = ""            # HF tokenizer id for exact counts (optional)
     memory_preamble: bool = True        # inject the CLM memory system prompt on first step
@@ -62,3 +80,13 @@ class HarnessConfig:
             raise ValueError("demote_threshold must be in [0, 1)")
         if not 0.0 <= self.reheat_boost <= 1.0:
             raise ValueError("reheat_boost must be in [0, 1]")
+        if self.sandbox_mode not in ("off", "jail", "docker"):
+            raise ValueError("sandbox_mode must be off | jail | docker")
+        if self.approval_mode not in ("auto", "ask", "deny"):
+            raise ValueError("approval_mode must be auto | ask | deny")
+        if self.max_tool_calls < 1:
+            raise ValueError("max_tool_calls must be >= 1")
+        if self.tool_timeout < 1:
+            raise ValueError("tool_timeout must be >= 1s")
+        if not 1 <= self.max_search_results <= 25:
+            raise ValueError("max_search_results must be in [1, 25]")

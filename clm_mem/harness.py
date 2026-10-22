@@ -25,6 +25,7 @@ ID_RE = re.compile(r"\b([A-Za-z][A-Za-z+]+-\d+)\b")
 from .config import HarnessConfig
 from .tagging import CLASSIFIER_SYSTEM, MEMORY_PREAMBLE, TAG_RE, split_tagged, strip_tags
 from .tokens import TokenCounter
+from .tools import ToolCall, parse_llm_tool_calls, render_call
 
 
 class MemoryHarness:
@@ -40,7 +41,7 @@ class MemoryHarness:
     """
 
     def __init__(self, llm, cfg: Optional[HarnessConfig] = None,
-                 systemone=None):
+                 systemone=None, tools_root: str = "", responder=None):
         """
         Args:
             llm: Chat backend with chat(messages) -> str method.
@@ -49,10 +50,19 @@ class MemoryHarness:
                 (pre-classification + eviction backstop). If provided, user
                 messages are classified before being sent to the LLM, and
                 eviction checks run a backstop query before dropping blocks.
+            tools_root: sandbox directory for agent tools; defaults to
+                ``<workdir>/sandbox`` so each workspace keeps its own files.
+            responder: optional blocking approval callback (CLI prompt) used
+                when ``approval_mode='ask'``.
         """
         self.llm = llm
         self.cfg = cfg or HarnessConfig()
         self.systemone = systemone
+        self.tools_root = tools_root or os.path.join(self.cfg.workdir,
+                                                     "sandbox")
+        from .tools import ToolManager      # here, not at import time, so the
+        self.tools = ToolManager(self.cfg, root=self.tools_root,   # package stays
+                                responder=responder)               # import-cheap
         self.counter = TokenCounter(self.cfg.tokenizer_name)
         self.blocks: List[Block] = []
         self.turn = 0
@@ -491,8 +501,14 @@ class MemoryHarness:
 
     # -- context-as-a-file mirror ------------------------------------------------
     def serialize_messages(self) -> List[Dict[str, str]]:
-        """The live window rendered as chat messages for the backend."""
-        return [{"role": b.role, "content": b.content} for b in self.blocks]
+        """The live window rendered as chat messages for the backend.
+
+        Tool transcripts (role ``tool``) go up as ordinary assistant text: any
+        OpenAI-compatible server understands that, and it keeps multi-step tool
+        reasoning in context without needing ``role=tool`` message support.
+        """
+        return [{"role": "assistant" if b.role == "tool" else b.role,
+                 "content": b.content} for b in self.blocks]
 
     def mirror_files(self) -> None:
         os.makedirs(self.cfg.workdir, exist_ok=True)
@@ -507,11 +523,79 @@ class MemoryHarness:
             for b in self.blocks:
                 f.write(json.dumps(dataclasses.asdict(b)) + "\n")
 
+    # -- agent tools ---------------------------------------------------------
+    def chat_tools(self, messages: List[Dict], specs: List[Dict]) -> Dict:
+        """Tool-capable completion when the backend supports it."""
+        fn = getattr(self.llm, "chat_tools", None)
+        if fn is None:
+            raise RuntimeError(f"{type(self.llm).__name__} has no chat_tools()")
+        return fn(messages, tools=specs)
+
+    def _render_tool_transcript(self, results: List[tuple]) -> str:
+        """What executed tools land in the model's context (bounded)."""
+        out = []
+        for call, res in results:
+            head = f"[tool {render_call(call.name, call.args)}]"
+            body = res.summary if res.ok else f"ERROR: {res.error or res.summary}"
+            detail = (res.detail or "")[:1200]
+            chunk = f"{head}\n{body}"
+            if detail:
+                chunk += f"\n{detail}"
+            out.append(chunk)
+        return "\n\n".join(out)
+
+    def _tool_event(self, res, call: ToolCall) -> None:
+        kind = "tool-call" if res.ok else "tool-error"
+        self._event(kind, res.summary if res.ok
+                    else f"{res.summary}: {res.error}")
+        if res.data.get("approval") == "denied":
+            self._event("tool-ask", f"{render_call(call.name, call.args)} denied")
+
+    def _agent_turn(self) -> Optional[str]:
+        """Run the tool loop for this turn; None when nothing was produced."""
+        specs = self.tools.llm_tools()
+        if not specs:
+            return None
+        raw: str = ""
+        used = 0
+        while used < self.cfg.max_tool_calls:
+            try:
+                msg = self.chat_tools(self.serialize_messages(), specs)
+            except Exception as exc:
+                self._event("warn",
+                            f"tool loop unavailable ({exc}); plain chat")
+                raw = self.llm.chat(self.serialize_messages())
+                break
+            calls = parse_llm_tool_calls(msg)
+            if not calls:
+                raw = str(msg.get("content") or "")
+                break
+            batch: List[tuple] = []
+            for c in calls:
+                res = self.tools.execute(c)
+                self._tool_event(res, c)
+                batch.append((c, res))
+                used += 1
+            # role "tool": visible to the model as assistant text (see
+            # serialize_messages) but never echoed back as a chat reply, and
+            # tagged short-term so the scratchpad stays forgettable.
+            self.add("tool", self._render_tool_transcript(batch), tag=SHORT)
+        else:
+            # budget of tool calls exhausted: ask for a final answer directly
+            self._event("tool-call",
+                        f"tool loop stopped at {used} calls; answering without")
+            raw = self.llm.chat(self.serialize_messages())
+        if not raw:
+            raw = self.llm.chat(self.serialize_messages())
+        return raw
+
     # -- top-level: one conversational turn ----------------------------------------
     def step(self, user_text: str) -> str:
         """Send a user message; returns the (tag-stripped) assistant reply.
 
         Side effects: eviction may run, files are mirrored, ``self.events`` grows.
+        When tools are active the model may call web/exec/fs tools first; their
+        results enter the window as short-term blocks and obey the same budget.
         """
         self.turn += 1
 
@@ -532,7 +616,9 @@ class MemoryHarness:
                             f"reheated {n} block(s) on access")
 
         self.evict()                                  # room BEFORE generating
-        raw = self.llm.chat(self.serialize_messages())
+        agent_raw = self._agent_turn() if self.tools.active else None
+        raw = agent_raw if agent_raw is not None else \
+            self.llm.chat(self.serialize_messages())
         if TAG_RE.search(raw) and self.cfg.classify_mode in ("inline", "both"):
             parts = split_tagged(raw)
             if any(tag != TRANSIENT for tag, _ in parts):
@@ -572,7 +658,7 @@ class MemoryHarness:
             return sum(1 for _ in f)
 
     def snapshot(self, preview_chars: int = 320, events_tail: int = 24,
-                 include_full: bool = False) -> Dict:
+                 include_full: bool = False, activity_tail: int = 14) -> Dict:
         """JSON-friendly view of the live window -- what the web UI renders.
 
         Blocks carry a `preview` plus token counts so the UI can show hints
@@ -609,6 +695,11 @@ class MemoryHarness:
             "archive": self.archive_size(),
             "blocks": blocks,
             "events": self.events[-events_tail:],
+            # agent surface: what tools are on, what they did, what is pending
+            "tools": self.tools.state(),
+            "activity": self.tools.activity(limit=activity_tail),
+            "approvals": self.tools.approvals() if self.tools.broker.mode != "auto"
+            else {"pending": [], "history": [], "mode": "auto"},
         }
 
     def counts(self) -> Dict[str, int]:
