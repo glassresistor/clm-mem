@@ -383,10 +383,7 @@ def test_supervisor_rejects_systemone_url_with_path(tmp_path):
     (or any provider alias) to it is rejected at supervisor startup."""
     from clm_mem.server import normalize_decision_root
 
-    assert (
-        normalize_decision_root("http://127.0.0.1:8010/")
-        == "http://127.0.0.1:8010"
-    )
+    assert normalize_decision_root("http://127.0.0.1:8010/") == "http://127.0.0.1:8010"
     assert normalize_decision_root("https://api.featherless.ai") == (
         "https://api.featherless.ai"
     )

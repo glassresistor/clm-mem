@@ -361,7 +361,9 @@ class SystemOneClient:
                 detail = e.read().decode(errors="replace")[:400]
             except Exception:
                 detail = ""
-            raise RuntimeError(f"SystemOne API error {e.code} at {url}: {detail}") from e
+            raise RuntimeError(
+                f"SystemOne API error {e.code} at {url}: {detail}"
+            ) from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"SystemOne API error: {e}") from e
 

@@ -94,7 +94,6 @@ def normalize_decision_root(url: str) -> str:
     return url
 
 
-
 def discover_backend_ctx(
     root_url: str, timeout: float = 5.0, api_key: str = ""
 ) -> Optional[int]:
@@ -541,9 +540,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # then any aliases. No URL is appended to the configured root
             # beyond these fixed paths.
             aliases = [cfg.systemone_alias] if cfg.systemone_alias else []
-            aliases += [
-                p for p in DECISION_PATHS if p not in aliases and p != path
-            ]
+            aliases += [p for p in DECISION_PATHS if p not in aliases and p != path]
             aliases.insert(aliases.index(path) if path in aliases else 0, path)
             # credential for the decision hop: explicit systemone key (or
             # $FEATHERLESS_API_KEY); fall back to the backend key only when
