@@ -282,18 +282,20 @@ def test_decision_aliases_proxied(sup):
 
 
 def test_systemone_client_sends_model_to_canonical_path():
-    """Regression: the client sends the required 'model' field and always
-    hits the full decision path (base + /v1/decisions) -- it never appends
-    provider aliases onto a configured URL."""
+    """Regression: the client sends the required 'model' field and POSTs to
+    its configured URL verbatim -- the complete endpoint URL, never treated
+    as a root to append paths to."""
     from clm_mem.llm import SystemOneClient
     from clm_mem.processes import ProcessManager, free_port
 
     mgr = ProcessManager()
     try:
         port = free_port()
-        # the mock serves the canonical decision route (plus legacy aliases)
+        # the mock serves the canonical decision route (plus provider aliases)
         h = mgr.start("s1", mgr.mock_argv("systemone"), port=port, timeout=30)
-        c = SystemOneClient(h.root_url, model="featherless-ai/Test-classifier")
+        c = SystemOneClient(
+            f"{h.root_url}/v1/decisions", model="featherless-ai/Test-classifier"
+        )
         out = c.system_one(
             "Remember: codename Nova",
             {
@@ -352,7 +354,9 @@ def test_systemone_client_sends_model_to_canonical_path():
             port2 = only.server_port
             t = threading.Thread(target=only.serve_forever, daemon=True)
             t.start()
-            c2 = SystemOneClient(f"http://127.0.0.1:{port2}", model="m")
+            # this stub answers only /v1/decisions -- a 200 proves the client
+            # POSTed to exactly its configured URL, nothing appended
+            c2 = SystemOneClient(f"http://127.0.0.1:{port2}/v1/decisions", model="m")
             out = c2.system_one(
                 "x",
                 {
@@ -364,63 +368,68 @@ def test_systemone_client_sends_model_to_canonical_path():
                 },
             )
             assert out["answers"]["q"]["choice"] == "longterm"
-            # a URL with an endpoint path appended is rejected outright --
-            # the client sets the full path itself, never concatenates.
-            for bad in (
-                f"http://127.0.0.1:{port2}/v1/decisions",
+            # every provider spelling is used verbatim -- a URL ending in
+            # /v1/systemone or /v1/classifier is POSTed to as-is (the stub
+            # answers nothing outside /v1/decisions, so hitting them proves
+            # the client appended nothing).
+            for url in (
                 f"http://127.0.0.1:{port2}/v1/systemone",
                 f"http://127.0.0.1:{port2}/v1/classifier",
             ):
-                with pytest.raises(ValueError, match="bare server root"):
-                    SystemOneClient(bad, model="m")
+                with pytest.raises(RuntimeError):
+                    SystemOneClient(url, model="m").system_one(
+                        "x", {"q": {"type": "noul", "instructions": "t"}}
+                    )
+            # a URL without a scheme is rejected outright
+            with pytest.raises(ValueError, match="complete decision endpoint"):
+                SystemOneClient("127.0.0.1:8010/v1/decisions", model="m")
             only.shutdown()  # inside the with: stop serve_forever
     finally:
         mgr.shutdown()
 
 
-def test_supervisor_rejects_systemone_url_with_path(tmp_path):
-    """--systemone-url must stay a bare root; appending the decision endpoint
-    (or any provider alias) to it is rejected at supervisor startup."""
-    from clm_mem.server import normalize_decision_root
-
-    assert normalize_decision_root("http://127.0.0.1:8010/") == "http://127.0.0.1:8010"
-    assert normalize_decision_root("https://api.featherless.ai") == (
-        "https://api.featherless.ai"
-    )
-    for bad in (
-        "https://api.featherless.ai/v1/decisions",
+def test_supervisor_uses_systemone_url_verbatim(tmp_path):
+    """--systemone-url is the complete decision endpoint URL: whatever path
+    structure it carries (canonical or any provider alias) is stored and
+    used exactly as given -- normalized only by stripping a trailing slash,
+    never appended to."""
+    for url in (
+        "https://api.featherless.ai/v1/classifier",
         "http://127.0.0.1:8010/v1/systemone",
-        "http://127.0.0.1:8010/v1/classifier",
+        "http://127.0.0.1:8010/v1/decisions/",
     ):
-        with pytest.raises(ValueError, match="bare server root"):
-            start_supervisor(
-                public_port=0,
-                backend_mode="none",
-                systemone_mode="external",
-                systemone_url=bad,
-                harness_kwargs={"workdir": str(tmp_path)},
-                timeout=30,
-            )
+        sup = start_supervisor(
+            public_port=0,
+            backend_mode="none",
+            systemone_mode="external",
+            systemone_url=url,
+            harness_kwargs={"workdir": str(tmp_path)},
+            timeout=30,
+        )
+        try:
+            assert sup.config.systemone_endpoint == url.rstrip("/")
+        finally:
+            sup.shutdown()
 
 
-def test_proxy_never_appends_urls_to_the_decision_root(sup):
-    """The proxy always talks to the full decision path (root + /v1/decisions)
-    and never appends any other URL to the configured root: no provider
-    aliases (/v1/systemone, /v1/classifier), no probing. Asserted at two
-    levels: behaviourally (the bundled mock answers only /v1/decisions, so a
-    200 proves the proxy hit that exact path) and structurally (every
-    upstream URL the proxy constructs toward the decision server is recorded
-    via a spy on urlopen -- process-global, hence serially executed by
-    pytest's default ordering -- and must equal root + /v1/decisions)."""
+def test_proxy_uses_the_configured_endpoint_verbatim(sup):
+    """The proxy relays every incoming decision spelling to
+    config.systemone_endpoint exactly as configured -- nothing is appended,
+    no alias probing, no fallback paths. Asserted at two levels: behaviourally
+    (the bundled mock's canonical route answers all three incoming spellings)
+    and structurally (every upstream URL the proxy constructs toward the
+    decision server is recorded via a spy on urlopen -- process-global, hence
+    serially executed by pytest's default ordering -- and must equal the
+    configured endpoint URL byte for byte)."""
     import clm_mem.server as server_mod
 
     hits = []
     real_urlopen = urllib.request.urlopen
-    s1_root = sup.config.systemone_root
+    s1_endpoint = sup.config.systemone_endpoint
 
     def spy_urlopen(req, *a, **kw):
         # only watch the decision-server hop; ignore chat-backend traffic
-        if getattr(req, "full_url", "").startswith(s1_root):
+        if getattr(req, "full_url", "").startswith(s1_endpoint):
             hits.append(req.full_url)
         return real_urlopen(req, *a, **kw)
 
@@ -440,11 +449,10 @@ def test_proxy_never_appends_urls_to_the_decision_root(sup):
     finally:
         server_mod.urllib.request.urlopen = real_urlopen
 
-    # every request that reached the decision server went to the root plus
-    # the canonical path -- nothing else was ever appended, no alias probing
+    # every request that reached the decision server went to the configured
+    # endpoint URL itself -- no path appended, no alias probing
     assert hits, "proxy never contacted the decision server"
-    expected = s1_root + "/v1/decisions"
-    assert all(h == expected for h in hits), hits
+    assert all(h == s1_endpoint for h in hits), hits
 
 
 def test_supervisor_spawns_and_kills_processes(tmp_path):

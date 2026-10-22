@@ -122,13 +122,13 @@ clm-mem serve --port 8080 --llama-server ./build/bin/llama-server \
     --systemone-passthrough          # fork build answers the decision route itself
 
 # already-running server + separate SystemOne API:
-# NOTE: --systemone-url is the bare root (scheme://host[:port]) only. Each
-# provider exposes the decision endpoint under a different URL structure
-# (/v1/decisions, /v1/systemone, /v1/classifier) but the request and response
-# are identical everywhere; clm-mem sets the full path to the decision
-# endpoint itself, so never append an endpoint path to this URL.
+# NOTE: --systemone-url is the COMPLETE decision endpoint URL and is used
+# exactly as given -- nothing is ever appended to it. Each provider exposes
+# the decision endpoint under a different URL structure (/v1/decisions,
+# /v1/systemone, /v1/classifier) but the request and response are identical
+# everywhere, so point the flag at whichever your server answers.
 clm-mem serve --backend-url http://localhost:8000/v1 \
-    --systemone-url http://localhost:8010
+    --systemone-url http://localhost:8010/v1/decisions
 
 # hosted chat backend (Featherless, OpenRouter, ...): --backend-api-key is the
 # bearer token the proxy sends on every LLM call it fronts -- including the
@@ -145,7 +145,7 @@ clm-mem serve --port 8080 \
 
 # hosted Featherless decision API instead of a local SystemOne server:
 clm-mem serve --backend-url http://localhost:8000/v1 \
-    --systemone-url https://api.featherless.ai \
+    --systemone-url https://api.featherless.ai/v1/classifier \
     --systemone-model featherless-ai/Qwen3.6-35B-A3B-classifier
     # auth via $FEATHERLESS_API_KEY or --systemone-api-key
 ```
@@ -182,8 +182,8 @@ client.chat.completions.create(model="mock-model",
 Supported surface (llama.cpp + OpenAI union): `/v1/chat/completions` (incl.
 SSE streaming), `/v1/models`, `/v1/decisions` (accepted incoming as the
 provider alias spellings `/v1/systemone` and `/v1/classifier` too, same
-contract; the proxy always relays to the full decision path on the configured
-bare root and never appends any other URL there), native `/completion`,
+contract; the proxy relays to `--systemone-url` verbatim -- that flag is the
+complete endpoint URL and nothing is appended to it), native `/completion`,
 `/props`, `/metrics`, `/version`, `/health`, CORS preflight, plus clm-mem
 introspection routes `/v1/clm/sessions`, `/v1/clm/sessions/<id>/status`,
 `.../reset`, and `DELETE /v1/clm/sessions/<id>` — and the full studio API

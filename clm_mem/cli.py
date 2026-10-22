@@ -625,11 +625,13 @@ def _add_common(sub: argparse.ArgumentParser) -> None:
     _add_harness_flags(sub)
     sub.add_argument(
         "--systemone-url",
-        default="http://127.0.0.1:8010",
-        help="bare root URL of the System One Lite decision server "
-        "(scheme://host[:port] only -- do not append endpoint paths like "
-        "/v1/decisions or /v1/systemone; the client sets the full path to "
-        "the decision endpoint itself). Used for typed decisions "
+        default="http://127.0.0.1:8010/v1/decisions",
+        help="complete URL of the System One decision endpoint, used "
+        "exactly as given (nothing is appended to it). Providers expose "
+        "it under different structures -- e.g. "
+        "http://localhost:8010/v1/systemone for a llama.cpp fork build or "
+        "https://api.featherless.ai/v1/classifier -- but the request and "
+        "response are identical everywhere. Used for typed decisions "
         "(pre-classification + eviction backstop). "
         "Set to 'none' to disable.",
     )
@@ -767,12 +769,11 @@ def cmd_chat(a: argparse.Namespace) -> None:
         max_tokens=a.max_tokens,
     )
 
-    # Wire up SystemOne for typed decisions if configured. The probe goes
-    # through the same client the harness will use later: --systemone-url is
-    # the bare server root and the client sets the full path to the decision
-    # endpoint itself (every provider answers the same request/response
-    # contract there). A raw ping with no model always fails against both
-    # the fork and Featherless.
+    # Wire up SystemOne for typed decisions if configured. --systemone-url is
+    # the complete decision endpoint URL, used verbatim: each provider puts
+    # it at a different path structure but answers the same request/response
+    # contract there, so nothing is appended and nothing is probed. A raw
+    # ping with no model always fails against both the fork and Featherless.
     systemone = None
     if a.systemone_url and a.systemone_url.lower() != "none":
         try:
@@ -925,11 +926,11 @@ def _add_serve_flags(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--systemone-url",
         default="",
-        help="bare root URL of an already-running System One decision "
-        "server, scheme://host[:port] only (e.g. http://localhost:8010 or "
-        "https://api.featherless.ai). Do not append endpoint paths such as "
-        "/v1/decisions, /v1/systemone or /v1/classifier -- the client sets "
-        "the full path to the decision endpoint itself",
+        help="complete URL of an already-running System One decision "
+        "endpoint, used exactly as given (nothing is appended to it) -- "
+        "e.g. http://localhost:8010/v1/systemone for a llama.cpp fork "
+        "build or https://api.featherless.ai/v1/classifier; every "
+        "provider answers the same request/response contract there",
     )
     sub.add_argument(
         "--systemone-model",
@@ -1045,7 +1046,7 @@ def cmd_serve(a: argparse.Namespace) -> None:
         "root_url": sup.base_url,
         "model": a.served_model,
         "backend": sup.config.backend_root,
-        "systemone": sup.config.systemone_root,
+        "systemone": sup.config.systemone_endpoint,
         "backend_ctx": sup.config.backend_ctx,
         "budget": hk.get("max_context_tokens"),
         "tools_enabled": bool(hk.get("tools_enabled")),
@@ -1065,7 +1066,7 @@ def cmd_serve(a: argparse.Namespace) -> None:
             f"{sup.config.harness_kwargs.get('max_context_tokens')} tokens "
             f"(llama.cpp window: {sup.config.backend_ctx or 'unknown'})"
         )
-        print(f"  systemone api    : {sup.config.systemone_root or '(none)'}")
+        print(f"  systemone api    : {sup.config.systemone_endpoint or '(none)'}")
         if sup.ui_url:
             print(f"  web studio       : {sup.ui_url}  (MCP tools: {sup.base_url}/mcp)")
         if hk.get("tools_enabled"):

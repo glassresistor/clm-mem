@@ -44,10 +44,9 @@ NATIVE_POST_PATHS = ("/completion", "/embedding")
 
 #: Public decision routes the proxy accepts. Providers expose the same
 #: request/response contract under different URL structures (/v1/decisions,
-#: /v1/systemone, /v1/classifier); clients and upstream relays use the
-#: canonical one, so it is first. The aliases are accepted only as incoming
-#: spellings -- they are never appended to a configured root; the proxy talks
-#: to SYSTEMONE_PATH (the full decision path) exclusively.
+#: /v1/systemone, /v1/classifier), so all three spellings are accepted
+#: incoming; each is answered from cfg.systemone_endpoint -- the complete
+#: endpoint URL as configured, used verbatim (nothing is ever appended).
 DECISION_PATHS = ("/v1/decisions", "/v1/systemone", "/v1/classifier")
 
 # Workspace sessions are named ``ws:<name>`` so the colon keeps them in one
@@ -73,27 +72,13 @@ def normalize_root(url: str) -> str:
     return url
 
 
-def normalize_decision_root(url: str) -> str:
-    """Validate a --systemone-url into the bare decision-server root.
-
-    Every SystemOne provider (llama.cpp fork, mock, hosted Featherless) uses
-    a different URL structure for the decision endpoint but the same request
-    and response contract, so callers pass only the root and the client sets
-    the full path to the decision endpoint itself. Appending endpoint paths
-    (/v1/decisions, /v1/systemone, /v1/classifier) to the configured URL is
-    rejected here -- it is never done implicitly.
-    """
-    from .llm import SYSTEMONE_ALIASES, SYSTEMONE_PATH
-
-    url = normalize_root(url)
-    if url.endswith(SYSTEMONE_PATH) or url.endswith(SYSTEMONE_ALIASES):
-        raise ValueError(
-            f"systemone-url must be the bare server root (e.g. "
-            f"http://127.0.0.1:8010 or https://api.featherless.ai); got "
-            f"{url!r} -- do not append endpoint paths to it; the client sets "
-            f"the full path to the decision endpoint itself"
-        )
-    return url
+def _same_origin(endpoint: Optional[str], root: Optional[str]) -> bool:
+    """True when a complete decision endpoint URL sits on a backend root --
+    i.e. the fork-passthrough case where the chat backend serves the decision
+    route itself and one credential authenticates both hops."""
+    if not endpoint or not root:
+        return False
+    return endpoint.rstrip("/").startswith(root.rstrip("/") + "/")
 
 
 def discover_backend_ctx(
@@ -153,7 +138,7 @@ def discover_backend_ctx(
 class ProxyConfig:
     backend_root: Optional[str] = None  # e.g. http://127.0.0.1:8081
     backend_api_key: str = ""  # bearer for hosted chat backends
-    systemone_root: Optional[str] = None  # e.g. http://127.0.0.1:8010
+    systemone_endpoint: Optional[str] = None  # complete decision endpoint URL
     systemone_model: str = ""  # model id sent to the decision API
     systemone_api_key: str = ""  # bearer for hosted decision APIs
     served_model: str = "clm-mem-model"
@@ -500,31 +485,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if path in ("/mcp", "/v1/mcp"):
             return self._mcp()
         if path in DECISION_PATHS:
-            target = cfg.systemone_root or cfg.backend_root
+            # Providers expose the same request/response contract under
+            # different URL structures; whatever spelling arrives from the
+            # client is answered from cfg.systemone_endpoint -- the complete
+            # endpoint URL exactly as configured, used verbatim with nothing
+            # appended to it.
+            target = cfg.systemone_endpoint
             if not target:
                 self.send_error_json(503, "systemone is not configured")
                 return
             body = self.read_body_bytes()
-            # Providers expose the same request/response contract under
-            # different URL structures; the proxy always talks to the full
-            # decision path -- SYSTEMONE_PATH appended to the configured bare
-            # root -- and never appends any other URL (no aliases, no
-            # probing), whatever spelling arrived from the client.
-            from .llm import SYSTEMONE_PATH
-
             # credential for the decision hop: explicit systemone key (or
             # $FEATHERLESS_API_KEY); fall back to the backend key only when
             # the decision server *is* the chat backend (fork passthrough),
             # and otherwise relay whatever the client brought.
             auth = cfg.systemone_api_key or os.environ.get("FEATHERLESS_API_KEY", "")
-            if not auth and target == cfg.backend_root:
+            if not auth and _same_origin(cfg.systemone_endpoint, cfg.backend_root):
                 auth = cfg.backend_api_key
-            self._forward(
-                "POST",
-                f"{target}{SYSTEMONE_PATH}",
-                body,
-                api_key=auth,
-            )
+            self._forward("POST", target, body, api_key=auth)
         if path.startswith("/v1/clm/"):
             return self._clm_post(path)
         if path in NATIVE_POST_PATHS and cfg.backend_root:
@@ -1026,16 +1004,18 @@ class Supervisor:
             max_tokens=cfg.chat_max_tokens,
         )
         systemone = None
-        if cfg.systemone_root:
+        if cfg.systemone_endpoint:
             from .llm import SystemOneClient
 
             # fork passthrough: the decision server *is* the chat backend, so
             # a key configured for one authenticates both hops
             syskey = cfg.systemone_api_key or (
-                cfg.backend_api_key if cfg.systemone_root == cfg.backend_root else ""
+                cfg.backend_api_key
+                if _same_origin(cfg.systemone_endpoint, cfg.backend_root)
+                else ""
             )
             systemone = SystemOneClient(
-                cfg.systemone_root, model=cfg.systemone_model, api_key=syskey
+                cfg.systemone_endpoint, model=cfg.systemone_model, api_key=syskey
             )
         h = MemoryHarness(llm, HarnessConfig(**kwargs), systemone=systemone)
         with self.lock:
@@ -1229,26 +1209,34 @@ def start_supervisor(
     else:
         raise ValueError(f"unknown backend_mode {backend_mode!r}")
 
-    systemone_root: Optional[str] = None
+    systemone_endpoint: Optional[str] = None
     if systemone_mode == "mock":
-        systemone_root = spawn(
+        root = spawn(
             "systemone-mock",
             manager.mock_argv("systemone"),
             ("--host", "{host}", "--port", "{port}"),
         )
+        # the mock answers at the canonical decision route
+        systemone_endpoint = f"{root}/v1/decisions"
     elif systemone_mode == "spawn":
         if not systemone_cmd:
             raise ValueError("systemone_mode='spawn' needs systemone_cmd")
-        systemone_root = spawn("systemone", systemone_cmd, systemone_flags)
+        root = spawn("systemone", systemone_cmd, systemone_flags)
+        # a spawned local SystemOne server is expected to answer the
+        # canonical decision route (set --systemone-url for others)
+        systemone_endpoint = f"{root}/v1/decisions"
     elif systemone_mode == "external":
         if not systemone_url:
             raise ValueError("systemone_mode='external' needs systemone_url")
-        # bare root only; the client appends the decision path itself
-        systemone_root = normalize_decision_root(systemone_url)
+        # --systemone-url IS the complete decision endpoint URL: used exactly
+        # as given, never treated as a root to append paths to.
+        systemone_endpoint = systemone_url.rstrip("/")
     elif systemone_mode == "passthrough":
-        systemone_root = backend_root  # fork serves it itself
+        # fork build serves the decision route itself at the canonical path
+        if backend_root:
+            systemone_endpoint = f"{backend_root}/v1/decisions"
     elif systemone_mode in ("none", None):
-        systemone_root = None
+        systemone_endpoint = None
     else:
         raise ValueError(f"unknown systemone_mode {systemone_mode!r}")
 
@@ -1271,7 +1259,7 @@ def start_supervisor(
     config = ProxyConfig(
         backend_root=backend_root,
         backend_api_key=backend_api_key,
-        systemone_root=systemone_root,
+        systemone_endpoint=systemone_endpoint,
         systemone_model=systemone_model,
         systemone_api_key=systemone_api_key,
         backend_ctx=backend_ctx,

@@ -265,9 +265,10 @@ class SystemOneHandler(_Silent):
         else:
             self.send_json({"error": "not found", "path": path}, 404)
 
-    # canonical decision route only (provider aliases intentionally absent
-    # here so tests prove nothing implicit is appended).
-    SYSTEMONE_PATHS = ("/v1/decisions",)
+    # the mock serves the canonical decision route plus the provider alias
+    # spellings; all answer with the same request/response contract, matching
+    # what real providers expose under different URL structures.
+    SYSTEMONE_PATHS = ("/v1/decisions", "/v1/systemone", "/v1/classifier")
 
     def do_POST(self):
         path = self.path.split("?")[0]

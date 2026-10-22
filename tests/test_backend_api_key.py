@@ -252,7 +252,8 @@ def test_systemone_route_uses_configured_decision_key(tmp_path):
         backend_mode="external",
         backend_url=root,
         systemone_mode="external",
-        systemone_url=root,
+        # complete endpoint URL, exactly as providers expose it
+        systemone_url=f"{root}/v1/decisions",
         systemone_api_key="secret-sys",
         harness_kwargs={"workdir": str(tmp_path), "max_context_tokens": 600},
         timeout=30,

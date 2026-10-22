@@ -262,20 +262,23 @@ class StubChat:
         return json.dumps({"labels": labels})
 
 
-#: The canonical decision endpoint path. Every SystemOne-style server -- the
-#: llama.cpp fork, the mock, and the hosted Featherless classifier service --
-#: answers the *same* request/response contract at this route; providers may
-#: additionally expose aliases (/v1/systemone, /v1/classifier) but clients
-#: talk to ``/v1/decisions`` directly. ``--systemone-url`` must therefore be
-#: a bare root (scheme://host[:port]); the client appends this path and never
-#: appends anything else to the configured URL.
+#: Providers expose the decision endpoint under different URL structures --
+#: ``/v1/decisions`` on the mock, ``/v1/systemone`` on llama.cpp fork builds,
+#: ``/v1/classifier`` on the hosted Featherless classifier service -- but all
+#: answer the *same* request/response contract there. That is why nothing in
+#: clm-mem constructs a decision URL: ``--systemone-url`` IS the complete
+#: endpoint URL and is used verbatim, so every provider's structure works
+#: without code knowing it.
 SYSTEMONE_PATH = "/v1/decisions"
 
 #: Provider-specific aliases for the decision endpoint (llama.cpp forks answer
-#: /v1/systemone; Featherless documents /v1/classifier). Clients never use
-#: them -- they exist only so a misconfigured ``--systemone-url`` that already
-#: ends in one of these paths can be rejected with a helpful message.
+#: /v1/systemone; Featherless documents /v1/classifier). Nothing in clm-mem
+#: appends them anywhere -- they only name the routes a proxy may accept from
+#: clients using those provider spellings.
 SYSTEMONE_ALIASES = ("/v1/systemone", "/v1/classifier")
+
+#: Incoming public decision routes: canonical path plus the aliases above.
+SYSTEMONE_PATHS = (SYSTEMONE_PATH,) + SYSTEMONE_ALIASES
 
 #: Both APIs reject bodies without a non-empty ``model`` field, so the client
 #: always sends one; override via --systemone-model / the studio settings.
@@ -288,38 +291,32 @@ class SystemOneClient:
     Sends typed questions (choice, score, noul) and returns calibrated
     answers. Used for memory classification and eviction backstops.
 
-    Works against both the local llama.cpp SystemOne fork and the hosted
-    Featherless classifier endpoint: every provider exposes the same request
-    and response contract, so the client always POSTs to the full decision
-    path (``base_url + /v1/decisions``). ``base_url`` must be a bare root --
-    never append paths (or aliases like /v1/systemone or /v1/classifier) to
-    it. The request body always carries a ``model`` field (required by both
-    servers), plus optional bearer auth.
+    Works against any provider -- the local llama.cpp SystemOne fork, the
+    bundled mock, or the hosted Featherless classifier service -- even though
+    each exposes the decision endpoint under a different URL structure,
+    because they all answer the same request and response contract there.
+    ``base_url`` IS the complete endpoint URL: it is used verbatim and never
+    treated as a root to append paths to (no /v1/decisions, no aliases --
+    nothing). Pass e.g. http://localhost:8010/v1/systemone or
+    https://api.featherless.ai/v1/classifier. The request body always carries
+    a ``model`` field (required by both servers), plus optional bearer auth.
 
-    Default base URL is http://127.0.0.1:8010 (local System One Lite server).
+    Default base URL is http://127.0.0.1:8010/v1/decisions (the bundled mock's
+    local System One Lite endpoint).
     """
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8010",
+        base_url: str = "http://127.0.0.1:8010/v1/decisions",
         model: str = "",
         api_key: str = "",
     ):
         self.base_url = base_url.rstrip("/")
         if not self.base_url.lower().startswith(("http://", "https://")):
             raise ValueError(
-                f"systemone-url must be a full URL with a scheme, e.g. "
-                f"http://127.0.0.1:8010 or https://api.featherless.ai; got "
-                f"{base_url!r}"
-            )
-        if self.base_url.endswith(SYSTEMONE_PATH) or self.base_url.endswith(
-            SYSTEMONE_ALIASES
-        ):
-            raise ValueError(
-                f"systemone-url must be the bare server root (e.g. "
-                f"http://127.0.0.1:8010 or https://api.featherless.ai); got "
-                f"{base_url!r} -- do not append endpoint paths to it; the "
-                f"client sets the full path to the decision endpoint itself"
+                f"systemone-url must be the complete decision endpoint URL, "
+                f"e.g. http://localhost:8010/v1/systemone or "
+                f"https://api.featherless.ai/v1/classifier; got {base_url!r}"
             )
         self.model = model or DEFAULT_SYSTEMONE_MODEL
         self.api_key = api_key or os.environ.get("FEATHERLESS_API_KEY", "")
@@ -327,8 +324,8 @@ class SystemOneClient:
     def system_one(self, state: Any, questions: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluate a state against typed questions.
 
-        Always POSTs to the full decision path (``base_url + /v1/decisions``);
-        no URL is appended to the configured root beyond that fixed path.
+        POSTs to ``base_url`` exactly as configured -- the complete endpoint
+        URL -- appending nothing to it.
 
         Args:
             state: The input text or JSON object to evaluate.
@@ -342,7 +339,7 @@ class SystemOneClient:
         import urllib.request
         import urllib.error
 
-        url = f"{self.base_url}{SYSTEMONE_PATH}"
+        url = self.base_url
         body = json.dumps(
             {"model": self.model, "state": state, "questions": questions}
         ).encode()
