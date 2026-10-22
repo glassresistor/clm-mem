@@ -946,7 +946,7 @@ def _add_serve_flags(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--systemone-passthrough",
         action="store_true",
-        help="the backend itself answers /v1/systemone " "(SystemOne fork build)",
+        help="the backend itself answers the decision route " "(SystemOne fork build)",
     )
     sub.add_argument(
         "--log-dir", default="", help="where backend process logs go (default: tmpdir)"

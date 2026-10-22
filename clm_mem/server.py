@@ -44,8 +44,10 @@ NATIVE_POST_PATHS = ("/completion", "/embedding")
 
 #: Public decision routes the proxy accepts. Providers expose the same
 #: request/response contract under different URL structures (/v1/decisions,
-#: /v1/systemone, /v1/classifier); the canonical one is first so clients and
-#: upstream relays use it directly.
+#: /v1/systemone, /v1/classifier); clients and upstream relays use the
+#: canonical one, so it is first. The aliases are accepted only as incoming
+#: spellings -- they are never appended to a configured root; the proxy talks
+#: to SYSTEMONE_PATH (the full decision path) exclusively.
 DECISION_PATHS = ("/v1/decisions", "/v1/systemone", "/v1/classifier")
 
 # Workspace sessions are named ``ws:<name>`` so the colon keeps them in one
@@ -161,7 +163,6 @@ class ProxyConfig:
     request_timeout: float = 300.0
     ui_enabled: bool = True  # serve the bundled web studio at /
     backend_ctx: Optional[int] = None  # live llama.cpp window (from /props)
-    systemone_alias: str = ""  # cached decision endpoint path
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -247,17 +248,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         url: str,
         body: bytes | None = None,
         stream: bool = False,
-        probe: bool = False,
         api_key: Optional[str] = None,
-        miss: Optional[list] = None,
     ):
-        """Proxy one request to a backend. With ``probe=True`` the response is
-        buffered and NOT sent to the client; True means "this alias exists"
-        (any HTTP status other than 404/405), False means try another path.
+        """Proxy one request to a backend and relay its response (status,
+        payload and content type included) straight through, so callers
+        see the upstream server's own errors -- e.g. a decision server
+        answering 404 with its own message on a route it does not expose.
         ``api_key`` overrides the credential carried upstream (see
-        :meth:`_auth_header`). On a probe miss, ``miss`` (if given) receives
-        ``(status, body, content_type)`` so the caller can relay the server's
-        own error instead of a generic message."""
+        :meth:`_auth_header`)."""
         headers = {"Content-Type": "application/json", **self._auth_header(api_key)}
         req = urllib.request.Request(
             url, data=body if method.upper() != "GET" else None, headers=headers
@@ -267,41 +265,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 req, timeout=self.supervisor.config.request_timeout
             )
         except urllib.error.HTTPError as e:
-            if probe and e.code in (404, 405):
-                if miss is not None:
-                    try:
-                        payload = e.read()
-                    except Exception:
-                        payload = b""
-                    miss.append(
-                        (
-                            e.code,
-                            payload,
-                            e.headers.get("Content-Type", "application/json"),
-                        )
-                    )
-                return False
             self._respond_payload(
                 e.code, e.read(), e.headers.get("Content-Type", "application/json")
             )
             return True
         except Exception as exc:  # backend down / connection refused
-            if probe:
-                return False
             self.send_error_json(502, f"backend unreachable at {url}: {exc}")
             return True
-        if probe:
-            payload = resp.read()
-            status = getattr(resp, "status", 200) or 200
-            ok = status not in (404, 405)
-            if ok:
-                self._respond_payload(
-                    status,
-                    payload,
-                    resp.headers.get("Content-Type", "application/json"),
-                )
-            resp.close()
-            return ok
         ctype = resp.headers.get("Content-Type", "")
         if stream and ctype.startswith("text/event-stream"):
             self._start_sse()
@@ -535,13 +505,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.send_error_json(503, "systemone is not configured")
                 return
             body = self.read_body_bytes()
-            # Every provider answers the same request/response contract at
-            # its own URL structure; try the canonical decision path first,
-            # then any aliases. No URL is appended to the configured root
-            # beyond these fixed paths.
-            aliases = [cfg.systemone_alias] if cfg.systemone_alias else []
-            aliases += [p for p in DECISION_PATHS if p not in aliases and p != path]
-            aliases.insert(aliases.index(path) if path in aliases else 0, path)
+            # Providers expose the same request/response contract under
+            # different URL structures; the proxy always talks to the full
+            # decision path -- SYSTEMONE_PATH appended to the configured bare
+            # root -- and never appends any other URL (no aliases, no
+            # probing), whatever spelling arrived from the client.
+            from .llm import SYSTEMONE_PATH
+
             # credential for the decision hop: explicit systemone key (or
             # $FEATHERLESS_API_KEY); fall back to the backend key only when
             # the decision server *is* the chat backend (fork passthrough),
@@ -549,24 +519,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             auth = cfg.systemone_api_key or os.environ.get("FEATHERLESS_API_KEY", "")
             if not auth and target == cfg.backend_root:
                 auth = cfg.backend_api_key
-            misses: list = []
-            for alias in aliases:
-                if self._forward(
-                    "POST",
-                    f"{target}{alias}",
-                    body,
-                    probe=True,
-                    api_key=auth,
-                    miss=misses,
-                ):
-                    cfg.systemone_alias = alias  # sticky for later calls
-                    return
-            if misses:  # relay the server's own error (e.g. Featherless 404
-                # "model not enabled") instead of a generic proxy message.
-                status, payload, ctype = misses[0]
-                self._respond_payload(status, payload, ctype)
-            else:
-                self.send_error_json(503, "no decision endpoint answered")
+            self._forward(
+                "POST",
+                f"{target}{SYSTEMONE_PATH}",
+                body,
+                api_key=auth,
+            )
         if path.startswith("/v1/clm/"):
             return self._clm_post(path)
         if path in NATIVE_POST_PATHS and cfg.backend_root:
@@ -1218,7 +1176,7 @@ def start_supervisor(
     Modes for backend/systemone are: ``mock`` (bundled fake), ``spawn``
     (exec ``*_cmd`` with host/port flags rendered in), ``external`` (already
     running; give its root URL) or ``none``. ``systemone_mode='passthrough'``
-    means the backend itself answers ``/v1/systemone`` (SystemOne fork of
+    means the backend itself answers the decision route (SystemOne fork of
     llama.cpp server). ``backend_api_key`` is the bearer token sent to the
     chat backend on every proxied/harness LLM call -- needed for hosted
     OpenAI-compatible services; unset local servers ignore it.

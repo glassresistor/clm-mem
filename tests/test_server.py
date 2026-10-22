@@ -403,22 +403,48 @@ def test_supervisor_rejects_systemone_url_with_path(tmp_path):
             )
 
 
-def test_decision_canonical_path_first(sup):
-    """The proxy tries /v1/decisions before provider aliases, and relays the
-    server's own error body when no route answers."""
-    # mock serves the canonical path; a successful call caches it sticky
-    st, resp = http_call(
-        sup,
-        "/v1/decisions",
-        "POST",
-        {
-            "model": "sys-one",
-            "state": "Remember: password hunter2",
-            "questions": SYS_Q,
-        },
-    )
-    assert st == 200
-    assert sup.config.systemone_alias == "/v1/decisions"
+def test_proxy_never_appends_urls_to_the_decision_root(sup):
+    """The proxy always talks to the full decision path (root + /v1/decisions)
+    and never appends any other URL to the configured root: no provider
+    aliases (/v1/systemone, /v1/classifier), no probing. Asserted at two
+    levels: behaviourally (the bundled mock answers only /v1/decisions, so a
+    200 proves the proxy hit that exact path) and structurally (every
+    upstream URL the proxy constructs toward the decision server is recorded
+    via a spy on urlopen -- process-global, hence serially executed by
+    pytest's default ordering -- and must equal root + /v1/decisions)."""
+    import clm_mem.server as server_mod
+
+    hits = []
+    real_urlopen = urllib.request.urlopen
+    s1_root = sup.config.systemone_root
+
+    def spy_urlopen(req, *a, **kw):
+        # only watch the decision-server hop; ignore chat-backend traffic
+        if getattr(req, "full_url", "").startswith(s1_root):
+            hits.append(req.full_url)
+        return real_urlopen(req, *a, **kw)
+
+    body = {
+        "model": "sys-one",
+        "state": "Remember: password hunter2",
+        "questions": SYS_Q,
+    }
+    monkeypatched = getattr(server_mod.urllib.request, "urlopen", None)
+    assert monkeypatched is real_urlopen
+    server_mod.urllib.request.urlopen = spy_urlopen
+    try:
+        for incoming in ("/v1/decisions", "/v1/systemone", "/v1/classifier"):
+            st, resp = http_call(sup, incoming, "POST", body)
+            assert st == 200, incoming
+            assert resp["answers"]["duration"]["choice"] == "longterm", incoming
+    finally:
+        server_mod.urllib.request.urlopen = real_urlopen
+
+    # every request that reached the decision server went to the root plus
+    # the canonical path -- nothing else was ever appended, no alias probing
+    assert hits, "proxy never contacted the decision server"
+    expected = s1_root + "/v1/decisions"
+    assert all(h == expected for h in hits), hits
 
 
 def test_supervisor_spawns_and_kills_processes(tmp_path):

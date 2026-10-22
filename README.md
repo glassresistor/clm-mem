@@ -180,8 +180,10 @@ client.chat.completions.create(model="mock-model",
 ```
 
 Supported surface (llama.cpp + OpenAI union): `/v1/chat/completions` (incl.
-SSE streaming), `/v1/models`, `/v1/decisions` (plus the provider aliases
-`/v1/systemone` and `/v1/classifier`, same contract), native `/completion`,
+SSE streaming), `/v1/models`, `/v1/decisions` (accepted incoming as the
+provider alias spellings `/v1/systemone` and `/v1/classifier` too, same
+contract; the proxy always relays to the full decision path on the configured
+bare root and never appends any other URL there), native `/completion`,
 `/props`, `/metrics`, `/version`, `/health`, CORS preflight, plus clm-mem
 introspection routes `/v1/clm/sessions`, `/v1/clm/sessions/<id>/status`,
 `.../reset`, and `DELETE /v1/clm/sessions/<id>` — and the full studio API
