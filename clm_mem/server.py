@@ -42,6 +42,12 @@ SESSION_HEADER = "X-Cllm-Mem-Session"
 NATIVE_GET_PATHS = ("/props", "/metrics", "/specs")
 NATIVE_POST_PATHS = ("/completion", "/embedding")
 
+#: Public decision routes the proxy accepts. Providers expose the same
+#: request/response contract under different URL structures (/v1/decisions,
+#: /v1/systemone, /v1/classifier); the canonical one is first so clients and
+#: upstream relays use it directly.
+DECISION_PATHS = ("/v1/decisions", "/v1/systemone", "/v1/classifier")
+
 # Workspace sessions are named ``ws:<name>`` so the colon keeps them in one
 # URL path segment while tagging which project sandbox a harness lives in.
 WS_PREFIX = "ws:"
@@ -63,6 +69,30 @@ def normalize_root(url: str) -> str:
     if url.endswith("/v1"):
         url = url[:-3].rstrip("/")
     return url
+
+
+def normalize_decision_root(url: str) -> str:
+    """Validate a --systemone-url into the bare decision-server root.
+
+    Every SystemOne provider (llama.cpp fork, mock, hosted Featherless) uses
+    a different URL structure for the decision endpoint but the same request
+    and response contract, so callers pass only the root and the client sets
+    the full path to the decision endpoint itself. Appending endpoint paths
+    (/v1/decisions, /v1/systemone, /v1/classifier) to the configured URL is
+    rejected here -- it is never done implicitly.
+    """
+    from .llm import SYSTEMONE_ALIASES, SYSTEMONE_PATH
+
+    url = normalize_root(url)
+    if url.endswith(SYSTEMONE_PATH) or url.endswith(SYSTEMONE_ALIASES):
+        raise ValueError(
+            f"systemone-url must be the bare server root (e.g. "
+            f"http://127.0.0.1:8010 or https://api.featherless.ai); got "
+            f"{url!r} -- do not append endpoint paths to it; the client sets "
+            f"the full path to the decision endpoint itself"
+        )
+    return url
+
 
 
 def discover_backend_ctx(
@@ -220,12 +250,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         stream: bool = False,
         probe: bool = False,
         api_key: Optional[str] = None,
+        miss: Optional[list] = None,
     ):
         """Proxy one request to a backend. With ``probe=True`` the response is
         buffered and NOT sent to the client; True means "this alias exists"
         (any HTTP status other than 404/405), False means try another path.
         ``api_key`` overrides the credential carried upstream (see
-        :meth:`_auth_header`)."""
+        :meth:`_auth_header`). On a probe miss, ``miss`` (if given) receives
+        ``(status, body, content_type)`` so the caller can relay the server's
+        own error instead of a generic message."""
         headers = {"Content-Type": "application/json", **self._auth_header(api_key)}
         req = urllib.request.Request(
             url, data=body if method.upper() != "GET" else None, headers=headers
@@ -236,6 +269,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
         except urllib.error.HTTPError as e:
             if probe and e.code in (404, 405):
+                if miss is not None:
+                    try:
+                        payload = e.read()
+                    except Exception:
+                        payload = b""
+                    miss.append(
+                        (
+                            e.code,
+                            payload,
+                            e.headers.get("Content-Type", "application/json"),
+                        )
+                    )
                 return False
             self._respond_payload(
                 e.code, e.read(), e.headers.get("Content-Type", "application/json")
@@ -485,20 +530,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return self._chat_completions()
         if path in ("/mcp", "/v1/mcp"):
             return self._mcp()
-        if path in ("/v1/systemone", "/v1/classifier", "/v1/decisions"):
+        if path in DECISION_PATHS:
             target = cfg.systemone_root or cfg.backend_root
             if not target:
                 self.send_error_json(503, "systemone is not configured")
                 return
             body = self.read_body_bytes()
-            # the decision server may only expose one of its aliases (the
-            # llama.cpp fork serves /v1/systemone, Featherless both); probe
-            # each path and relay the first response that is not a 404/405.
+            # Every provider answers the same request/response contract at
+            # its own URL structure; try the canonical decision path first,
+            # then any aliases. No URL is appended to the configured root
+            # beyond these fixed paths.
             aliases = [cfg.systemone_alias] if cfg.systemone_alias else []
             aliases += [
-                p
-                for p in ("/v1/systemone", "/v1/classifier", "/v1/decisions")
-                if p not in aliases and p != path
+                p for p in DECISION_PATHS if p not in aliases and p != path
             ]
             aliases.insert(aliases.index(path) if path in aliases else 0, path)
             # credential for the decision hop: explicit systemone key (or
@@ -508,13 +552,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
             auth = cfg.systemone_api_key or os.environ.get("FEATHERLESS_API_KEY", "")
             if not auth and target == cfg.backend_root:
                 auth = cfg.backend_api_key
+            misses: list = []
             for alias in aliases:
                 if self._forward(
-                    "POST", f"{target}{alias}", body, probe=True, api_key=auth
+                    "POST",
+                    f"{target}{alias}",
+                    body,
+                    probe=True,
+                    api_key=auth,
+                    miss=misses,
                 ):
                     cfg.systemone_alias = alias  # sticky for later calls
                     return
-            self.send_error_json(503, "no decision endpoint answered")
+            if misses:  # relay the server's own error (e.g. Featherless 404
+                # "model not enabled") instead of a generic proxy message.
+                status, payload, ctype = misses[0]
+                self._respond_payload(status, payload, ctype)
+            else:
+                self.send_error_json(503, "no decision endpoint answered")
         if path.startswith("/v1/clm/"):
             return self._clm_post(path)
         if path in NATIVE_POST_PATHS and cfg.backend_root:
@@ -1233,7 +1288,8 @@ def start_supervisor(
     elif systemone_mode == "external":
         if not systemone_url:
             raise ValueError("systemone_mode='external' needs systemone_url")
-        systemone_root = normalize_root(systemone_url)
+        # bare root only; the client appends the decision path itself
+        systemone_root = normalize_decision_root(systemone_url)
     elif systemone_mode == "passthrough":
         systemone_root = backend_root  # fork serves it itself
     elif systemone_mode in ("none", None):

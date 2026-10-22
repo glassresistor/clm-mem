@@ -98,7 +98,7 @@ def make_stub(key="", sys_key=""):
                         ],
                     },
                 )
-            elif path in ("/v1/systemone", "/v1/classifier"):
+            elif path in ("/v1/decisions", "/v1/systemone", "/v1/classifier"):
                 want = f"Bearer {sys_key}" if sys_key else None
                 if want and auth != want:
                     self._send(401, {"error": {"message": "bad or missing key"}})
@@ -261,7 +261,7 @@ def test_systemone_route_uses_configured_decision_key(tmp_path):
         # proxied decision route: proxy must attach the systemone key itself
         st, resp = http_call(
             sup,
-            "/v1/systemone",
+            "/v1/decisions",
             "POST",
             {
                 "model": "systemone",
@@ -271,7 +271,7 @@ def test_systemone_route_uses_configured_decision_key(tmp_path):
         )
         assert st == 200, resp
         assert "answers" in resp
-        sys_calls = [c for c in calls if c[1].startswith("/v1/systemone")]
+        sys_calls = [c for c in calls if c[1].startswith("/v1/decisions")]
         assert sys_calls and all(
             c[2] == "Bearer secret-sys" for c in sys_calls
         ), sys_calls
@@ -282,7 +282,8 @@ def test_systemone_route_uses_configured_decision_key(tmp_path):
 
 def test_fork_passthrough_decision_route_inherits_backend_key(tmp_path):
     # stub requires `Bearer dual` on BOTH chat and decision routes, but the
-    # supervisor is only given a backend key (fork serves /v1/systemone itself)
+    # supervisor is only given a backend key (fork serves the decision route
+    # itself)
     root, calls, stop = make_stub(key="dual", sys_key="dual")
     sup = start_supervisor(
         public_port=0,
@@ -297,7 +298,7 @@ def test_fork_passthrough_decision_route_inherits_backend_key(tmp_path):
     try:
         st, resp = http_call(
             sup,
-            "/v1/systemone",
+            "/v1/decisions",
             "POST",
             {
                 "model": "systemone",

@@ -119,9 +119,14 @@ clm-mem serve --use-mock --port 8080 --served-model mock-model \
 # real llama.cpp behind it:
 clm-mem serve --port 8080 --llama-server ./build/bin/llama-server \
     --model-file models/Qwen3-8B-IQ2_K.gguf --ctx-size 16384 \
-    --systemone-passthrough          # fork build answers /v1/systemone itself
+    --systemone-passthrough          # fork build answers the decision route itself
 
 # already-running server + separate SystemOne API:
+# NOTE: --systemone-url is the bare root (scheme://host[:port]) only. Each
+# provider exposes the decision endpoint under a different URL structure
+# (/v1/decisions, /v1/systemone, /v1/classifier) but the request and response
+# are identical everywhere; clm-mem sets the full path to the decision
+# endpoint itself, so never append an endpoint path to this URL.
 clm-mem serve --backend-url http://localhost:8000/v1 \
     --systemone-url http://localhost:8010
 
@@ -175,7 +180,8 @@ client.chat.completions.create(model="mock-model",
 ```
 
 Supported surface (llama.cpp + OpenAI union): `/v1/chat/completions` (incl.
-SSE streaming), `/v1/models`, `/v1/systemone`, native `/completion`,
+SSE streaming), `/v1/models`, `/v1/decisions` (plus the provider aliases
+`/v1/systemone` and `/v1/classifier`, same contract), native `/completion`,
 `/props`, `/metrics`, `/version`, `/health`, CORS preflight, plus clm-mem
 introspection routes `/v1/clm/sessions`, `/v1/clm/sessions/<id>/status`,
 `.../reset`, and `DELETE /v1/clm/sessions/<id>` — and the full studio API

@@ -251,7 +251,7 @@ SYS_Q = {
 def test_systemone_proxied_through_public_port(sup):
     st, resp = http_call(
         sup,
-        "/v1/systemone",
+        "/v1/decisions",
         "POST",
         {
             "model": "sys-one",
@@ -263,28 +263,35 @@ def test_systemone_proxied_through_public_port(sup):
     assert resp["answers"]["duration"]["choice"] == "longterm"
 
 
-def test_classifier_alias_proxied(sup):
-    """/v1/classifier (Featherless spelling) is proxied to the decision server."""
-    st, resp = http_call(
-        sup,
-        "/v1/classifier",
-        "POST",
-        {"model": "sys-one", "state": "Remember: password hunter2", "questions": SYS_Q},
-    )
-    assert st == 200
-    assert resp["answers"]["duration"]["choice"] == "longterm"
+def test_decision_aliases_proxied(sup):
+    """Legacy provider spellings (/v1/systemone, /v1/classifier) are still
+    proxied to the decision server; same request/response contract."""
+    for alias in ("/v1/systemone", "/v1/classifier"):
+        st, resp = http_call(
+            sup,
+            alias,
+            "POST",
+            {
+                "model": "sys-one",
+                "state": "Remember: password hunter2",
+                "questions": SYS_Q,
+            },
+        )
+        assert st == 200, alias
+        assert resp["answers"]["duration"]["choice"] == "longterm", alias
 
 
-def test_systemone_client_sends_model_and_probes_aliases():
-    """Regression: the client must send the required 'model' field and fall
-    back across endpoint aliases (/v1/systemone <-> /v1/classifier)."""
+def test_systemone_client_sends_model_to_canonical_path():
+    """Regression: the client sends the required 'model' field and always
+    hits the full decision path (base + /v1/decisions) -- it never appends
+    provider aliases onto a configured URL."""
     from clm_mem.llm import SystemOneClient
     from clm_mem.processes import ProcessManager, free_port
 
     mgr = ProcessManager()
     try:
         port = free_port()
-        # the mock serves both aliases; point at a path-only server below
+        # the mock serves the canonical decision route (plus legacy aliases)
         h = mgr.start("s1", mgr.mock_argv("systemone"), port=port, timeout=30)
         c = SystemOneClient(h.root_url, model="featherless-ai/Test-classifier")
         out = c.system_one(
@@ -300,7 +307,8 @@ def test_systemone_client_sends_model_and_probes_aliases():
         assert out["answers"]["duration"]["choice"] == "longterm"
         assert c.model == "featherless-ai/Test-classifier"
 
-        # a base URL whose first alias 404s must still land on the second
+        # a stub that rejects anything but /v1/decisions: the client must go
+        # straight to the canonical path (and reject misconfigured URLs)
         import threading
         from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
         import json as _json
@@ -320,7 +328,8 @@ def test_systemone_client_sends_model_and_probes_aliases():
                 if not body.get("model"):  # mirrors both real APIs
                     self._send(422, {"error": "model required"})
                     return
-                if self.path == "/v1/systemone":
+                if self.path != "/v1/decisions":
+                    # only the canonical decision route exists here
                     self._send(404, {"error": "no such route"})
                     return
                 self._send(
@@ -355,25 +364,66 @@ def test_systemone_client_sends_model_and_probes_aliases():
                 },
             )
             assert out["answers"]["q"]["choice"] == "longterm"
-            assert c2._path == "/v1/classifier", "should stick to the alias that works"
-            # second call skips probing and goes straight to the cached path
-            out = c2.system_one(
-                "y",
-                {
-                    "q": {
-                        "type": "choice",
-                        "instructions": "t",
-                        "criteria": {"a": None, "b": None},
-                    }
-                },
-            )
-            assert out["answers"]["q"]["choice"] == "longterm"
+            # a URL with an endpoint path appended is rejected outright --
+            # the client sets the full path itself, never concatenates.
+            for bad in (
+                f"http://127.0.0.1:{port2}/v1/decisions",
+                f"http://127.0.0.1:{port2}/v1/systemone",
+                f"http://127.0.0.1:{port2}/v1/classifier",
+            ):
+                with pytest.raises(ValueError, match="bare server root"):
+                    SystemOneClient(bad, model="m")
             only.shutdown()  # inside the with: stop serve_forever
     finally:
         mgr.shutdown()
 
 
-# -- process lifecycle -------------------------------------------------------------
+def test_supervisor_rejects_systemone_url_with_path(tmp_path):
+    """--systemone-url must stay a bare root; appending the decision endpoint
+    (or any provider alias) to it is rejected at supervisor startup."""
+    from clm_mem.server import normalize_decision_root
+
+    assert (
+        normalize_decision_root("http://127.0.0.1:8010/")
+        == "http://127.0.0.1:8010"
+    )
+    assert normalize_decision_root("https://api.featherless.ai") == (
+        "https://api.featherless.ai"
+    )
+    for bad in (
+        "https://api.featherless.ai/v1/decisions",
+        "http://127.0.0.1:8010/v1/systemone",
+        "http://127.0.0.1:8010/v1/classifier",
+    ):
+        with pytest.raises(ValueError, match="bare server root"):
+            start_supervisor(
+                public_port=0,
+                backend_mode="none",
+                systemone_mode="external",
+                systemone_url=bad,
+                harness_kwargs={"workdir": str(tmp_path)},
+                timeout=30,
+            )
+
+
+def test_decision_canonical_path_first(sup):
+    """The proxy tries /v1/decisions before provider aliases, and relays the
+    server's own error body when no route answers."""
+    # mock serves the canonical path; a successful call caches it sticky
+    st, resp = http_call(
+        sup,
+        "/v1/decisions",
+        "POST",
+        {
+            "model": "sys-one",
+            "state": "Remember: password hunter2",
+            "questions": SYS_Q,
+        },
+    )
+    assert st == 200
+    assert sup.config.systemone_alias == "/v1/decisions"
+
+
 def test_supervisor_spawns_and_kills_processes(tmp_path):
     s = start_supervisor(
         public_port=0,

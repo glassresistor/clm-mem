@@ -262,11 +262,20 @@ class StubChat:
         return json.dumps({"labels": labels})
 
 
-#: Both the llama.cpp SystemOne fork and the Featherless classifier service
-#: answer this endpoint family; ``/v1/classifier`` is the canonical hosted
-#: path (also served as /v1/systemone and /v1/decisions), while local fork
-#: builds only expose /v1/systemone. We try them in that order and cache.
-SYSTEMONE_PATHS = ("/v1/systemone", "/v1/classifier")
+#: The canonical decision endpoint path. Every SystemOne-style server -- the
+#: llama.cpp fork, the mock, and the hosted Featherless classifier service --
+#: answers the *same* request/response contract at this route; providers may
+#: additionally expose aliases (/v1/systemone, /v1/classifier) but clients
+#: talk to ``/v1/decisions`` directly. ``--systemone-url`` must therefore be
+#: a bare root (scheme://host[:port]); the client appends this path and never
+#: appends anything else to the configured URL.
+SYSTEMONE_PATH = "/v1/decisions"
+
+#: Provider-specific aliases for the decision endpoint (llama.cpp forks answer
+#: /v1/systemone; Featherless documents /v1/classifier). Clients never use
+#: them -- they exist only so a misconfigured ``--systemone-url`` that already
+#: ends in one of these paths can be rejected with a helpful message.
+SYSTEMONE_ALIASES = ("/v1/systemone", "/v1/classifier")
 
 #: Both APIs reject bodies without a non-empty ``model`` field, so the client
 #: always sends one; override via --systemone-model / the studio settings.
@@ -280,8 +289,12 @@ class SystemOneClient:
     answers. Used for memory classification and eviction backstops.
 
     Works against both the local llama.cpp SystemOne fork and the hosted
-    Featherless classifier endpoint. The request body always carries a
-    ``model`` field (required by both servers), plus optional bearer auth.
+    Featherless classifier endpoint: every provider exposes the same request
+    and response contract, so the client always POSTs to the full decision
+    path (``base_url + /v1/decisions``). ``base_url`` must be a bare root --
+    never append paths (or aliases like /v1/systemone or /v1/classifier) to
+    it. The request body always carries a ``model`` field (required by both
+    servers), plus optional bearer auth.
 
     Default base URL is http://127.0.0.1:8010 (local System One Lite server).
     """
@@ -293,13 +306,29 @@ class SystemOneClient:
         api_key: str = "",
     ):
         self.base_url = base_url.rstrip("/")
+        if not self.base_url.lower().startswith(("http://", "https://")):
+            raise ValueError(
+                f"systemone-url must be a full URL with a scheme, e.g. "
+                f"http://127.0.0.1:8010 or https://api.featherless.ai; got "
+                f"{base_url!r}"
+            )
+        if self.base_url.endswith(SYSTEMONE_PATH) or self.base_url.endswith(
+            SYSTEMONE_ALIASES
+        ):
+            raise ValueError(
+                f"systemone-url must be the bare server root (e.g. "
+                f"http://127.0.0.1:8010 or https://api.featherless.ai); got "
+                f"{base_url!r} -- do not append endpoint paths to it; the "
+                f"client sets the full path to the decision endpoint itself"
+            )
         self.model = model or DEFAULT_SYSTEMONE_MODEL
         self.api_key = api_key or os.environ.get("FEATHERLESS_API_KEY", "")
-        # cached endpoint path that worked (see SYSTEMONE_PATHS)
-        self._path: Optional[str] = None
 
     def system_one(self, state: Any, questions: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluate a state against typed questions.
+
+        Always POSTs to the full decision path (``base_url + /v1/decisions``);
+        no URL is appended to the configured root beyond that fixed path.
 
         Args:
             state: The input text or JSON object to evaluate.
@@ -313,50 +342,28 @@ class SystemOneClient:
         import urllib.request
         import urllib.error
 
-        paths = ([self._path] if self._path else []) + [
-            p for p in SYSTEMONE_PATHS if p != self._path
-        ]
-        last_exc: Optional[Exception] = None
-        for path in paths:
-            body = json.dumps(
-                {"model": self.model, "state": state, "questions": questions}
-            ).encode()
-            headers = {"Content-Type": "application/json"}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            req = urllib.request.Request(
-                f"{self.base_url}{path}", data=body, headers=headers, method="POST"
-            )
+        url = f"{self.base_url}{SYSTEMONE_PATH}"
+        body = json.dumps(
+            {"model": self.model, "state": state, "questions": questions}
+        ).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            # Featherless returns 404 for "model not enabled for the
+            # classifier"; carry the error body through so a wrong
+            # --systemone-model surfaces as the server's message.
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    out = json.loads(resp.read().decode())
-                    self._path = path  # sticky: skip probing next time
-                    return out
-            except urllib.error.HTTPError as e:
-                # 404/405 usually means this server does not expose that route
-                # -- try the alias before giving up. (Featherless also uses
-                # 404 for "model not enabled for /classifier", so keep the
-                # error body around; it ends up in the final message.)
-                if e.code in (404, 405):
-                    try:
-                        detail = e.read().decode(errors="replace")[:400]
-                    except Exception:
-                        detail = ""
-                    last_exc = RuntimeError(
-                        f"SystemOne API {e.code} at {path}: {detail}"
-                    )
-                    continue
+                detail = e.read().decode(errors="replace")[:400]
+            except Exception:
                 detail = ""
-                try:
-                    detail = e.read().decode(errors="replace")[:400]
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    f"SystemOne API error {e.code} at {path}: {detail}"
-                ) from e
-            except urllib.error.URLError as e:
-                last_exc = e
-        raise RuntimeError(f"SystemOne API error: {last_exc}") from last_exc
+            raise RuntimeError(f"SystemOne API error {e.code} at {url}: {detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"SystemOne API error: {e}") from e
 
     def classify_memory(self, text: str) -> str:
         """Classify a conversation block's memory duration.

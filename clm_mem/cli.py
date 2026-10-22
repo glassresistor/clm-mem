@@ -626,7 +626,10 @@ def _add_common(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--systemone-url",
         default="http://127.0.0.1:8010",
-        help="System One Lite API URL for typed decisions "
+        help="bare root URL of the System One Lite decision server "
+        "(scheme://host[:port] only -- do not append endpoint paths like "
+        "/v1/decisions or /v1/systemone; the client sets the full path to "
+        "the decision endpoint itself). Used for typed decisions "
         "(pre-classification + eviction backstop). "
         "Set to 'none' to disable.",
     )
@@ -765,16 +768,21 @@ def cmd_chat(a: argparse.Namespace) -> None:
     )
 
     # Wire up SystemOne for typed decisions if configured. The probe goes
-    # through the same client (and therefore the same endpoint aliases and
-    # required "model" field) the harness will use later -- a raw urllib ping
-    # with no model always fails against both the fork and Featherless.
+    # through the same client the harness will use later: --systemone-url is
+    # the bare server root and the client sets the full path to the decision
+    # endpoint itself (every provider answers the same request/response
+    # contract there). A raw ping with no model always fails against both
+    # the fork and Featherless.
     systemone = None
     if a.systemone_url and a.systemone_url.lower() != "none":
-        systemone = SystemOneClient(
-            a.systemone_url,
-            model=a.systemone_model,
-            api_key=getattr(a, "systemone_api_key", ""),
-        )
+        try:
+            systemone = SystemOneClient(
+                a.systemone_url,
+                model=a.systemone_model,
+                api_key=getattr(a, "systemone_api_key", ""),
+            )
+        except ValueError as e:
+            parser.error(str(e))
         try:
             probe = systemone.system_one(
                 "test", {"q": {"type": "noul", "instructions": "is this a test?"}}
@@ -782,8 +790,8 @@ def cmd_chat(a: argparse.Namespace) -> None:
             if "answers" not in probe:
                 raise RuntimeError(f"unexpected reply: {probe}")
             print(
-                f"SystemOne decision API: {a.systemone_url} (OK, "
-                f"model={systemone.model}, endpoint={systemone._path})"
+                f"SystemOne decision API: {systemone.base_url} (OK, "
+                f"model={systemone.model})"
             )
         except Exception as e:
             print(f"WARNING: SystemOne API unreachable at {a.systemone_url}: {e}")
@@ -917,8 +925,11 @@ def _add_serve_flags(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--systemone-url",
         default="",
-        help="URL of an already-running System One API "
-        "(local fork or https://api.featherless.ai)",
+        help="bare root URL of an already-running System One decision "
+        "server, scheme://host[:port] only (e.g. http://localhost:8010 or "
+        "https://api.featherless.ai). Do not append endpoint paths such as "
+        "/v1/decisions, /v1/systemone or /v1/classifier -- the client sets "
+        "the full path to the decision endpoint itself",
     )
     sub.add_argument(
         "--systemone-model",
